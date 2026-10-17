@@ -1,0 +1,12 @@
+import { Command } from '@redis/client/dist/lib/RESP/types';
+import RANGE, { transformRangeArguments } from './RANGE';
+
+export default {
+  parseCommand(...args: Parameters<typeof transformRangeArguments>) {
+    const parser = args[0];
+
+    parser.push('TS.REVRANGE');
+    transformRangeArguments(...args);
+  },
+  transformReply: RANGE.transformReply
+} as const satisfies Command;

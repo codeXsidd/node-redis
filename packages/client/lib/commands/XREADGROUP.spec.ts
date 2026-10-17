@@ -1,0 +1,382 @@
+import { strict as assert } from 'node:assert';
+import testUtils, { GLOBAL, parseFirstKey } from '../test-utils';
+import XREADGROUP from './XREADGROUP';
+import { parseArgs } from './generic-transformers';
+import { RESP_TYPES } from '../RESP/decoder';
+
+describe('XREADGROUP', () => {
+  describe('FIRST_KEY_INDEX', () => {
+    it('single stream', () => {
+      assert.equal(
+        parseFirstKey(XREADGROUP, '', '', { key: 'key', id: '' }),
+        'key'
+      );
+    });
+
+    it('multiple streams', () => {
+      assert.equal(
+        parseFirstKey(XREADGROUP, '', '', [{ key: '1', id: '' }, { key: '2', id: '' }]),
+        '1'
+      );
+    });
+  });
+
+  describe('transformArguments', () => {
+    it('single stream', () => {
+      assert.deepEqual(
+        parseArgs(XREADGROUP, 'group', 'consumer', {
+          key: 'key',
+          id: '0-0'
+        }),
+        ['XREADGROUP', 'GROUP', 'group', 'consumer', 'STREAMS', 'key', '0-0']
+      );
+    });
+
+    it('multiple streams', () => {
+      assert.deepEqual(
+        parseArgs(XREADGROUP, 'group', 'consumer', [{
+          key: '1',
+          id: '0-0'
+        }, {
+          key: '2',
+          id: '0-0'
+        }]),
+        ['XREADGROUP', 'GROUP', 'group', 'consumer', 'STREAMS', '1', '2', '0-0', '0-0']
+      );
+    });
+
+    it('with COUNT', () => {
+      assert.deepEqual(
+        parseArgs(XREADGROUP, 'group', 'consumer', {
+          key: 'key',
+          id: '0-0'
+        }, {
+          COUNT: 1
+        }),
+        ['XREADGROUP', 'GROUP', 'group', 'consumer', 'COUNT', '1', 'STREAMS', 'key', '0-0']
+      );
+    });
+
+    it('with BLOCK', () => {
+      assert.deepEqual(
+        parseArgs(XREADGROUP, 'group', 'consumer', {
+          key: 'key',
+          id: '0-0'
+        }, {
+          BLOCK: 0
+        }),
+        ['XREADGROUP', 'GROUP', 'group', 'consumer', 'BLOCK', '0', 'STREAMS', 'key', '0-0']
+      );
+    });
+
+    it('with NOACK', () => {
+      assert.deepEqual(
+        parseArgs(XREADGROUP, 'group', 'consumer', {
+          key: 'key',
+          id: '0-0'
+        }, {
+          NOACK: true
+        }),
+        ['XREADGROUP', 'GROUP', 'group', 'consumer', 'NOACK', 'STREAMS', 'key', '0-0']
+      );
+    });
+
+    it('with COUNT, BLOCK, NOACK', () => {
+      assert.deepEqual(
+        parseArgs(XREADGROUP, 'group', 'consumer', {
+          key: 'key',
+          id: '0-0'
+        }, {
+          COUNT: 1,
+          BLOCK: 0,
+          NOACK: true
+        }),
+        ['XREADGROUP', 'GROUP', 'group', 'consumer', 'COUNT', '1', 'BLOCK', '0', 'NOACK', 'STREAMS', 'key', '0-0']
+      );
+    });
+
+    it('with CLAIM', () => {
+      assert.deepEqual(
+        parseArgs(XREADGROUP, 'group', 'consumer', {
+          key: 'key',
+          id: '0-0'
+        }, {
+          CLAIM: 100
+        }),
+        ['XREADGROUP', 'GROUP', 'group', 'consumer', 'CLAIM', '100', 'STREAMS', 'key', '0-0']
+      );
+    });
+
+    it('with COUNT, BLOCK, NOACK, CLAIM', () => {
+      assert.deepEqual(
+        parseArgs(XREADGROUP, 'group', 'consumer', {
+          key: 'key',
+          id: '0-0'
+        }, {
+          COUNT: 1,
+          BLOCK: 0,
+          NOACK: true,
+          CLAIM: 100
+        }),
+        ['XREADGROUP', 'GROUP', 'group', 'consumer', 'COUNT', '1', 'BLOCK', '0', 'CLAIM', '100', 'NOACK', 'STREAMS', 'key', '0-0']
+      );
+    });
+
+    it('with MAXCOUNT', () => {
+      assert.deepEqual(
+        parseArgs(XREADGROUP, 'group', 'consumer', {
+          key: 'key',
+          id: '0-0'
+        }, {
+          MAXCOUNT: 3
+        }),
+        ['XREADGROUP', 'GROUP', 'group', 'consumer', 'MAXCOUNT', '3', 'STREAMS', 'key', '0-0']
+      );
+    });
+
+    it('with MAXSIZE', () => {
+      assert.deepEqual(
+        parseArgs(XREADGROUP, 'group', 'consumer', {
+          key: 'key',
+          id: '0-0'
+        }, {
+          MAXSIZE: 65536
+        }),
+        ['XREADGROUP', 'GROUP', 'group', 'consumer', 'MAXSIZE', '65536', 'STREAMS', 'key', '0-0']
+      );
+    });
+
+    it('with COUNT, MAXCOUNT, MAXSIZE, BLOCK, CLAIM, NOACK', () => {
+      assert.deepEqual(
+        parseArgs(XREADGROUP, 'group', 'consumer', {
+          key: 'key',
+          id: '0-0'
+        }, {
+          COUNT: 2,
+          MAXCOUNT: 3,
+          MAXSIZE: 65536,
+          BLOCK: 0,
+          CLAIM: 100,
+          NOACK: true
+        }),
+        ['XREADGROUP', 'GROUP', 'group', 'consumer', 'COUNT', '2', 'MAXCOUNT', '3', 'MAXSIZE', '65536', 'BLOCK', '0', 'CLAIM', '100', 'NOACK', 'STREAMS', 'key', '0-0']
+      );
+    });
+  });
+
+  it('transformReply with a deleted pending entry and typeMapping', () => {
+    assert.deepEqual(
+      XREADGROUP.transformReply[2](
+        [['key', [['1-1', null], ['2-1', ['field', 'value']]]]],
+        undefined,
+        { [RESP_TYPES.MAP]: Map }
+      ),
+      [{
+        name: 'key',
+        messages: [{
+          id: '1-1',
+          message: null
+        }, {
+          id: '2-1',
+          message: new Map([['field', 'value']])
+        }]
+      }]
+    );
+  });
+
+  testUtils.testAll('xReadGroup - null', async client => {
+    const [, readGroupReply] = await Promise.all([
+      client.xGroupCreate('key', 'group', '$', {
+        MKSTREAM: true
+      }),
+      client.xReadGroup('group', 'consumer', {
+        key: 'key',
+        id: '>'
+      })
+    ]);
+
+    assert.equal(readGroupReply, null);
+  }, {
+    client: GLOBAL.SERVERS.OPEN,
+    cluster: GLOBAL.CLUSTERS.OPEN
+  });
+
+  testUtils.testAll('xReadGroup - with a message', async client => {
+    const [, id, readGroupReply] = await Promise.all([
+      client.xGroupCreate('key', 'group', '$', {
+        MKSTREAM: true
+      }),
+      client.xAdd('key', '*', { field: 'value' }),
+      client.xReadGroup('group', 'consumer', {
+        key: 'key',
+        id: '>'
+      })
+    ]);
+
+
+    // FUTURE resp3 compatible
+    const _obj = Object.assign({}, {
+      'key': [{
+        id: id,
+        message: Object.defineProperties({}, {
+          field: {
+            value: 'value',
+            configurable: true,
+            enumerable: true
+          }
+        })
+      }]
+    });
+
+    // v4 compatible
+    const expected = [{
+      name: 'key',
+      messages: [{
+        id: id,
+        message: Object.assign({}, {
+          field: 'value'
+        })
+      }]
+    }];
+
+    assert.deepStrictEqual(readGroupReply, expected);
+  }, {
+    client: GLOBAL.SERVERS.OPEN,
+    cluster: GLOBAL.CLUSTERS.OPEN
+  });
+
+  testUtils.testAll('xReadGroup - pending entry whose message was deleted', async client => {
+    // Regression: re-reading the PEL with id 0 returns [id, nil] for a trimmed entry
+    const [, trimmedId, id, , , readGroupReply] = await Promise.all([
+      client.xGroupCreate('key', 'group', '$', {
+        MKSTREAM: true
+      }),
+      client.xAdd('key', '*', { field: 'trimmed' }),
+      client.xAdd('key', '*', { field: 'value' }),
+      client.xReadGroup('group', 'consumer', {
+        key: 'key',
+        id: '>'
+      }),
+      client.xTrim('key', 'MAXLEN', 1),
+      client.xReadGroup('group', 'consumer', {
+        key: 'key',
+        id: '0'
+      })
+    ]);
+
+    assert.deepStrictEqual(readGroupReply, [{
+      name: 'key',
+      messages: [{
+        id: trimmedId,
+        message: null
+      }, {
+        id,
+        message: { field: 'value' }
+      }]
+    }]);
+  }, {
+    client: GLOBAL.SERVERS.OPEN,
+    cluster: GLOBAL.CLUSTERS.OPEN
+  });
+
+  testUtils.testAll('xReadGroup - without CLAIM should not include delivery fields', async client => {
+    const [, _id] = await Promise.all([
+      client.xGroupCreate('key', 'group', '$', {
+        MKSTREAM: true
+      }),
+      client.xAdd('key', '*', { field: 'value' })
+    ]);
+
+    const readGroupReply = await client.xReadGroup('group', 'consumer', {
+      key: 'key',
+      id: '>'
+    });
+
+    assert.ok(readGroupReply);
+    assert.equal(readGroupReply[0].messages[0].millisElapsedFromDelivery, undefined);
+    assert.equal(readGroupReply[0].messages[0].deliveriesCounter, undefined);
+  }, {
+    client: GLOBAL.SERVERS.OPEN,
+    cluster: GLOBAL.CLUSTERS.OPEN
+  });
+
+  testUtils.testWithClientIfVersionWithinRange([[8,4], 'LATEST'],'xReadGroup - with CLAIM should include delivery fields', async client => {
+    const [, id] = await Promise.all([
+      client.xGroupCreate('key', 'group', '$', {
+        MKSTREAM: true
+      }),
+      client.xAdd('key', '*', { field: 'value' })
+    ]);
+
+    // First read to add message to PEL
+    await client.xReadGroup('group', 'consumer', {
+      key: 'key',
+      id: '>'
+    });
+
+    // Read with CLAIM to get delivery fields
+    const readGroupReply = await client.xReadGroup('group', 'consumer2', {
+      key: 'key',
+      id: '>'
+    }, {
+      CLAIM: 0
+    });
+
+    assert.ok(readGroupReply);
+    assert.equal(readGroupReply[0].messages[0].id, id);
+    assert.ok(readGroupReply[0].messages[0].millisElapsedFromDelivery !== undefined);
+    assert.ok(readGroupReply[0].messages[0].deliveriesCounter !== undefined);
+    assert.equal(typeof readGroupReply[0].messages[0].millisElapsedFromDelivery, 'number');
+    assert.equal(typeof readGroupReply[0].messages[0].deliveriesCounter, 'number');
+  }, GLOBAL.SERVERS.OPEN);
+
+  testUtils.testWithClientIfVersionWithinRange([[8, 10], 'LATEST'], 'xReadGroup - MAXCOUNT caps entries cumulatively across streams', async client => {
+    await Promise.all([
+      client.xGroupCreate('{t}s1', 'group', '0', { MKSTREAM: true }),
+      client.xGroupCreate('{t}s2', 'group', '0', { MKSTREAM: true })
+    ]);
+    await Promise.all([
+      client.xAdd('{t}s1', '1-0', { field: 'v1' }),
+      client.xAdd('{t}s1', '2-0', { field: 'v2' }),
+      client.xAdd('{t}s2', '1-0', { field: 'v3' }),
+      client.xAdd('{t}s2', '2-0', { field: 'v4' })
+    ]);
+
+    const reply = await client.xReadGroup('group', 'consumer', [
+      { key: '{t}s1', id: '>' },
+      { key: '{t}s2', id: '>' }
+    ], {
+      MAXCOUNT: 3
+    });
+
+    assert.ok(reply);
+    const total = reply.reduce((sum, stream) => sum + stream.messages.length, 0);
+    assert.equal(total, 3);
+  }, GLOBAL.SERVERS.OPEN);
+
+  testUtils.testWithClientIfVersionWithinRange([[8, 10], 'LATEST'], 'xReadGroup - MAXSIZE caps reply size cumulatively across streams', async client => {
+    await Promise.all([
+      client.xGroupCreate('{t}s1', 'group', '0', { MKSTREAM: true }),
+      client.xGroupCreate('{t}s2', 'group', '0', { MKSTREAM: true })
+    ]);
+    await Promise.all([
+      client.xAdd('{t}s1', '1-0', { field: 'v1' }),
+      client.xAdd('{t}s1', '2-0', { field: 'v2' }),
+      client.xAdd('{t}s2', '1-0', { field: 'v3' }),
+      client.xAdd('{t}s2', '2-0', { field: 'v4' })
+    ]);
+
+    // MAXSIZE is a soft cumulative byte cap across all streams; the server always
+    // returns at least one entry, so MAXSIZE of 1 byte yields exactly one entry total.
+    const reply = await client.xReadGroup('group', 'consumer', [
+      { key: '{t}s1', id: '>' },
+      { key: '{t}s2', id: '>' }
+    ], {
+      MAXSIZE: 1
+    });
+
+    assert.ok(reply);
+    const total = reply.reduce((sum, stream) => sum + stream.messages.length, 0);
+    assert.equal(total, 1);
+  }, GLOBAL.SERVERS.OPEN);
+});

@@ -1,0 +1,2371 @@
+import COMMANDS from '../commands';
+import RedisSocket, { RedisSocketOptions } from './socket';
+import { BasicAuth, CredentialsError, CredentialsProvider, StreamingCredentialsProvider, UnableToObtainNewCredentialsError, Disposable } from '../authx';
+import RedisCommandsQueue, { CommandOptions } from './commands-queue';
+import { EventEmitter } from 'node:events';
+import { attachConfig, functionArgumentsPrefix, getTransformReply, scriptArgumentsPrefix } from '../commander';
+import { defaultCommandMetadata, isCacheable, isTrackable } from '../command-metadata';
+import { AbortError, ClientClosedError, ClientOfflineError, ClientSideCacheCommandError, ClientSideCacheMarkError, DisconnectsClientError, ErrorReply, WatchError } from '../errors';
+import { URL } from 'node:url';
+import { TcpSocketConnectOpts } from 'node:net';
+import { PUBSUB_TYPE, PubSubType, PubSubListener, PubSubTypeListeners, ChannelListeners } from './pub-sub';
+import { Command, CommandSignature, TypeMapping, CommanderConfig, RedisFunction, RedisFunctions, RedisModules, RedisScript, RedisScripts, ReplyUnion, RespVersions, RedisArgument, ReplyWithTypeMapping, SimpleStringReply, TransformReply, CommandArguments, DEFAULT_RESP } from '../RESP/types';
+import RedisClientMultiCommand, { RedisClientMultiCommandType } from './multi-command';
+import { MULTI_MODE, MultiMode, RedisMultiQueuedCommand } from '../multi-command';
+import HELLO, { HelloOptions } from '../commands/HELLO';
+import { ScanOptions, ScanCommonOptions } from '../commands/SCAN';
+import { RedisLegacyClient, RedisLegacyClientType } from './legacy-mode';
+import { RedisPoolOptions, RedisClientPool } from './pool';
+import { RedisVariadicArgument, parseArgs } from '../commands/generic-transformers';
+import { BasicClientSideCache, CLIENT_SIDE_CACHE_TRACKING_MODES, ClientSideCacheConfig, ClientSideCacheProvider } from './cache';
+import { BasicCommandParser, CommandParser, prefixKeys } from './parser';
+import SingleEntryCache from '../single-entry-cache';
+import { version } from '../../package.json'
+import EnterpriseMaintenanceManager, { MaintenanceUpdate, MovingEndpointType, SMIGRATED_EVENT, SMigratedEvent } from './enterprise-maintenance-manager';
+import { ClientMetricsHandle, ClientRegistry } from '../opentelemetry';
+import { ClientIdentity, ClientRole, generateClientId } from './identity';
+import { trace, sanitizeArgs, publish, CHANNELS, type CommandTraceContext } from './tracing';
+import { DEFAULT_COMMAND_TIMEOUT } from '../defaults';
+import { FieldsetRegistry, PreparedFieldsets } from '../himport/registry';
+import HIMPORT_DISCARD from '../commands/HIMPORT_DISCARD';
+import HIMPORT_DISCARDALL from '../commands/HIMPORT_DISCARDALL';
+import HIMPORT_PREPARE from '../commands/HIMPORT_PREPARE';
+import HIMPORT_SET from '../commands/HIMPORT_SET';
+import { ASKING_CMD } from '../commands/ASKING';
+
+const noop = () => {};
+
+const HIMPORT_SESSION_SUBCOMMANDS = new Set(['PREPARE', 'DISCARD', 'DISCARDALL']);
+
+/**
+ * MULTI/pipeline stores raw args only, so the HIMPORT transparency hook never sees these
+ * commands — a PREPARE/DISCARD executed that way would silently diverge the client registry
+ * from server state (a fieldset the registry doesn't know about, or a discarded one it
+ * would resurrect via lazy prepare). Rejected client-side at the exec funnel, which covers
+ * both the typed multi methods and raw `multi.addCommand(...)`. HIMPORT SET stays allowed:
+ * it mutates no registry state (the fieldset must already exist on the carrying connection).
+ */
+function assertNoHimportSessionCommands(commands: Array<RedisMultiQueuedCommand>) {
+  for (const { args } of commands) {
+    if (String(args[0]).toUpperCase() !== 'HIMPORT') continue;
+    if (HIMPORT_SESSION_SUBCOMMANDS.has(String(args[1]).toUpperCase())) {
+      throw new Error(
+        'HIMPORT PREPARE/DISCARD/DISCARDALL are not supported inside MULTI/pipeline; call them on the client before the transaction'
+      );
+    }
+  }
+}
+
+const CSC_MANAGED_CLIENT_SUBCOMMANDS = new Set(['CACHING', 'TRACKING']);
+
+/**
+ * With client-side caching on, the client owns the connection's tracking state: a user
+ * `CLIENT TRACKING` can reset the OPTIN/OPTOUT mode or stop invalidations, and a user
+ * `CLIENT CACHING` flag attaches to the wrong read. The handshake's `CLIENT TRACKING` and
+ * the `CLIENT CACHING` preludes go straight to the queue, so they never reach this check.
+ * Returns the refused command name (e.g. `CLIENT TRACKING`), if any.
+ */
+function cscManagedCommand(args: ReadonlyArray<RedisArgument>): string | undefined {
+  if (args.length < 2 || String(args[0]).toUpperCase() !== 'CLIENT') return;
+  const sub = String(args[1]).toUpperCase();
+  return CSC_MANAGED_CLIENT_SUBCOMMANDS.has(sub) ? `CLIENT ${sub}` : undefined;
+}
+
+function assertNoCscManagedCommands(commands: Array<RedisMultiQueuedCommand>) {
+  for (const { args } of commands) {
+    const command = cscManagedCommand(args);
+    if (command) throw new ClientSideCacheCommandError(command);
+  }
+}
+
+export interface RedisClientOptions<
+  M extends RedisModules = RedisModules,
+  F extends RedisFunctions = RedisFunctions,
+  S extends RedisScripts = RedisScripts,
+  RESP extends RespVersions = 3,
+  TYPE_MAPPING extends TypeMapping = TypeMapping,
+  SocketOptions extends RedisSocketOptions = RedisSocketOptions
+> extends CommanderConfig<M, F, S, RESP> {
+  /**
+   * `redis[s]://[[username][:password]@][host][:port][/db-number]`
+   * See [`redis`](https://www.iana.org/assignments/uri-schemes/prov/redis) and [`rediss`](https://www.iana.org/assignments/uri-schemes/prov/rediss) IANA registration for more details
+   */
+  url?: string;
+  /**
+   * Socket connection properties
+   */
+  socket?: SocketOptions;
+  /**
+   * ACL username ([see ACL guide](https://redis.io/topics/acl))
+   */
+  username?: string;
+  /**
+   * ACL password or the old "--requirepass" password
+   */
+  password?: string;
+
+  /**
+   * Provides credentials for authentication. Can be set directly or will be created internally
+   * if username/password are provided instead. If both are supplied, this credentialsProvider
+   * takes precedence over username/password.
+   */
+  credentialsProvider?: CredentialsProvider;
+  /**
+   * Client name ([see `CLIENT SETNAME`](https://redis.io/commands/client-setname))
+   */
+  name?: string;
+  /**
+   * Redis database number (see [`SELECT`](https://redis.io/commands/select) command)
+   */
+  database?: number;
+  /**
+   * Prefix prepended to every key sent to Redis (ioredis-compatible `keyPrefix`).
+   *
+   * Useful for isolating keyspaces — for example per-test isolation in CI, or
+   * separating an application's components (web app vs. background workers) within a
+   * single Redis instance.
+   *
+   * Matches ioredis semantics: only keys *sent* to Redis are prefixed. Keys *returned*
+   * by Redis (e.g. `KEYS`, `SCAN`, `RANDOMKEY`) are NOT un-prefixed, `SCAN`/`KEYS`
+   * `MATCH` patterns are NOT auto-prefixed, and Pub/Sub channels are NOT prefixed.
+   *
+   * @example
+   * ```
+   * const client = createClient({ keyPrefix: 'app:' });
+   * await client.set('key', 'value'); // stored as 'app:key'
+   * ```
+   */
+  keyPrefix?: RedisArgument;
+  /**
+   * Maximum length of the client's internal command queue
+   */
+  commandsQueueMaxLength?: number;
+  /**
+   * When `true`, commands are rejected when the client is reconnecting.
+   * When `false`, commands are queued for execution after reconnection.
+   */
+  disableOfflineQueue?: boolean;
+  /**
+   * Connect in [`READONLY`](https://redis.io/commands/readonly) mode
+   */
+  readonly?: boolean;
+  /**
+   * Send `PING` command at interval (in ms).
+   * Useful with Redis deployments that do not honor TCP Keep-Alive.
+   */
+  pingInterval?: number;
+  /**
+   * Default command options to be applied to all commands executed through this client.
+   *
+   * These options can be overridden on a per-command basis when calling specific commands.
+   *
+   * @property {symbol} [chainId] - Identifier for chaining commands together
+   * @property {boolean} [asap] - When true, the command is executed as soon as possible
+   * @property {AbortSignal} [abortSignal] - AbortSignal to cancel the command
+   * @property {TypeMapping} [typeMapping] - Custom type mappings between RESP and JavaScript types
+   *
+   * @example Setting default command options
+   * ```
+   * const client = createClient({
+   *   commandOptions: {
+   *     asap: true,
+   *     typeMapping: {
+   *       // Custom type mapping configuration
+   *     }
+   *   }
+   * });
+   * ```
+   */
+  commandOptions?: CommandOptions<TYPE_MAPPING>;
+  /**
+   * Client Side Caching configuration.
+   *
+   * Enables Redis Servers and Clients to work together to cache results from commands
+   * sent to a server. The server will notify the client when cached results are no longer valid.
+   *
+   * Note: Client Side Caching is only supported with RESP3.
+   *
+   * @example Anonymous cache configuration
+   * ```
+   * const client = createClient({
+   *   RESP: 3,
+   *   clientSideCache: {
+   *     ttl: 0,
+   *     maxEntries: 0,
+   *     evictPolicy: "LRU"
+   *   }
+   * });
+   * ```
+   *
+   * @example Using a controllable cache
+   * ```
+   * const cache = new BasicClientSideCache({
+   *   ttl: 0,
+   *   maxEntries: 0,
+   *   evictPolicy: "LRU"
+   * });
+   * const client = createClient({
+   *   RESP: 3,
+   *   clientSideCache: cache
+   * });
+   * ```
+   */
+  clientSideCache?: ClientSideCacheProvider | ClientSideCacheConfig;
+  /**
+   * @internal
+   * Shared HIMPORT fieldset registry. Pool/cluster/sentinel construct one instance and inject
+   * it into every client they own so a fieldset registered on the logical client can be
+   * transparently re-prepared on any physical connection; `duplicate()` injects the parent's.
+   * Not a user-facing option — when omitted the client owns a fresh registry.
+   */
+  himportRegistry?: FieldsetRegistry;
+  /**
+   * If set to true, disables sending client identifier (user-agent like message) to the redis server
+   */
+  disableClientInfo?: boolean;
+  /**
+   * Tag to append to library name that is sent to the Redis server
+   */
+  clientInfoTag?: string;
+  /**
+   * When set to true, client tracking is turned on and the client emits `invalidate` events when it receives invalidation messages from the redis server.
+   * Mutually exclusive with `clientSideCache` option.
+   */
+  emitInvalidate?: boolean;
+  /**
+   * Controls how the client handles Redis Enterprise maintenance push notifications.
+   *
+   * - `disabled`: The feature is not used by the client.
+   * - `enabled`: The client attempts to enable the feature on the server. If the server responds with an error, the connection is interrupted.
+   * - `auto`: The client attempts to enable the feature on the server. If the server returns an error, the client disables the feature and continues.
+   *
+   * The default is `auto`.
+   */
+  maintNotifications?: 'disabled' | 'enabled' | 'auto';
+  /**
+   * Controls how the client requests the endpoint to reconnect to during a MOVING notification in Redis Enterprise maintenance.
+   *
+   * - `auto`: If the connection is opened to a name or IP address that is from/resolves to a reserved private IP range, request an internal endpoint (e.g., internal-ip), otherwise an external one. If TLS is enabled, then request a FQDN.
+   * - `internal-ip`: Enforce requesting the internal IP.
+   * - `internal-fqdn`: Enforce requesting the internal FQDN.
+   * - `external-ip`: Enforce requesting the external IP address.
+   * - `external-fqdn`: Enforce requesting the external FQDN.
+   * - `none`: Used to request a null endpoint, which tells the client to reconnect based on its current config
+
+   * The default is `auto`.
+   */
+  maintEndpointType?: MovingEndpointType;
+  /**
+   * Specifies a more relaxed timeout (in milliseconds) for commands during a maintenance window.
+   * This helps minimize command timeouts during maintenance. Timeouts during maintenance period result
+   * in a `CommandTimeoutDuringMaintenance` error.
+   *
+   * The default is 10000
+   */
+  maintRelaxedCommandTimeout?: number;
+  /**
+   * Specifies a more relaxed timeout (in milliseconds) for the socket during a maintenance window.
+   * This helps minimize socket timeouts during maintenance. Timeouts during maintenance period result
+   * in a `SocketTimeoutDuringMaintenance` error.
+   *
+   * The default is 10000
+   */
+  maintRelaxedSocketTimeout?: number;
+};
+
+/**
+ * `RedisClientOptions` widened to accept any RESP version / module / function /
+ * script / type-mapping combination. Use when an internal callsite must accept
+ * any `RedisClientOptions` shape regardless of the public default (e.g. parsed
+ * URLs, sentinel node options, maintenance manager).
+ */
+export type AnyRedisClientOptions = RedisClientOptions<
+  RedisModules,
+  RedisFunctions,
+  RedisScripts,
+  RespVersions,
+  TypeMapping
+>;
+
+export type WithCommands<
+  RESP extends RespVersions,
+  TYPE_MAPPING extends TypeMapping
+> = {
+    [P in keyof typeof COMMANDS]: CommandSignature<(typeof COMMANDS)[P], RESP, TYPE_MAPPING>;
+  };
+
+export type WithModules<
+  M extends RedisModules,
+  RESP extends RespVersions,
+  TYPE_MAPPING extends TypeMapping
+> = {
+    [P in keyof M]: {
+      [C in keyof M[P]]: CommandSignature<M[P][C], RESP, TYPE_MAPPING>;
+    };
+  };
+
+export type WithFunctions<
+  F extends RedisFunctions,
+  RESP extends RespVersions,
+  TYPE_MAPPING extends TypeMapping
+> = {
+    [L in keyof F]: {
+      [C in keyof F[L]]: CommandSignature<F[L][C], RESP, TYPE_MAPPING>;
+    };
+  };
+
+export type WithScripts<
+  S extends RedisScripts,
+  RESP extends RespVersions,
+  TYPE_MAPPING extends TypeMapping
+> = {
+    [P in keyof S]: CommandSignature<S[P], RESP, TYPE_MAPPING>;
+  };
+
+export type RedisClientExtensions<
+  M extends RedisModules = {},
+  F extends RedisFunctions = {},
+  S extends RedisScripts = {},
+  RESP extends RespVersions = 3,
+  TYPE_MAPPING extends TypeMapping = {}
+> = (
+    WithCommands<RESP, TYPE_MAPPING> &
+    WithModules<M, RESP, TYPE_MAPPING> &
+    WithFunctions<F, RESP, TYPE_MAPPING> &
+    WithScripts<S, RESP, TYPE_MAPPING>
+  );
+
+export type RedisClientType<
+  M extends RedisModules = {},
+  F extends RedisFunctions = {},
+  S extends RedisScripts = {},
+  RESP extends RespVersions = 3,
+  TYPE_MAPPING extends TypeMapping = {}
+> = (
+    RedisClient<M, F, S, RESP, TYPE_MAPPING> &
+    RedisClientExtensions<M, F, S, RESP, TYPE_MAPPING>
+  );
+
+type ProxyClient = RedisClient<RedisModules, RedisFunctions, RedisScripts, RespVersions, TypeMapping>;
+
+type NamespaceProxyClient = { _self: ProxyClient };
+
+export interface ScanIteratorOptions {
+  cursor?: RedisArgument;
+}
+
+export type MonitorCallback<TYPE_MAPPING extends TypeMapping = TypeMapping> = (reply: ReplyWithTypeMapping<SimpleStringReply, TYPE_MAPPING>) => unknown;
+
+/**
+ * A `sendCommand` rejection that happened BEFORE the command reached the wire (client closed
+ * or offline, an already-aborted signal, or a full queue — see `sendCommand`/`addCommand`).
+ * The HIMPORT layer rolls back optimistic registry mutations on these because the server never
+ * saw the command; genuine wire/server errors (`ErrorReply`, connection drops) are left to the
+ * replay path instead.
+ */
+function isPreEnqueueError(err: unknown): boolean {
+  return err instanceof ClientClosedError ||
+    err instanceof ClientOfflineError ||
+    err instanceof AbortError ||
+    (err instanceof Error && err.message === 'The queue is full');
+}
+
+export default class RedisClient<
+  M extends RedisModules,
+  F extends RedisFunctions,
+  S extends RedisScripts,
+  RESP extends RespVersions,
+  TYPE_MAPPING extends TypeMapping
+> extends EventEmitter {
+  static #createCommand(command: Command, resp: RespVersions) {
+    const transformReply = getTransformReply(command, resp);
+
+    return async function (this: ProxyClient, ...args: Array<unknown>) {
+      const parser = new BasicCommandParser(this._self._keyPrefix);
+      command.parseCommand(parser, ...args);
+
+      return this._self._executeCommand(command, parser, this._commandOptions, transformReply);
+    }
+  }
+
+  static #createModuleCommand(command: Command, resp: RespVersions) {
+    const transformReply = getTransformReply(command, resp);
+
+    return async function (this: NamespaceProxyClient, ...args: Array<unknown>) {
+      const parser = new BasicCommandParser(this._self._keyPrefix);
+      command.parseCommand(parser, ...args);
+
+      return this._self._executeCommand(command, parser, this._self._commandOptions, transformReply);
+    };
+  }
+
+  static #createFunctionCommand(name: string, fn: RedisFunction, resp: RespVersions) {
+    const prefix = functionArgumentsPrefix(name, fn);
+    const transformReply = getTransformReply(fn, resp);
+
+    return async function (this: NamespaceProxyClient, ...args: Array<unknown>) {
+      const parser = new BasicCommandParser(this._self._keyPrefix);
+      parser.push(...prefix);
+      fn.parseCommand(parser, ...args);
+
+      return this._self._executeCommand(fn, parser, this._self._commandOptions, transformReply);
+    };
+  }
+
+  static #createScriptCommand(script: RedisScript, resp: RespVersions) {
+    const prefix = scriptArgumentsPrefix(script);
+    const transformReply = getTransformReply(script, resp);
+
+    return async function (this: ProxyClient, ...args: Array<unknown>) {
+      const parser = new BasicCommandParser(this._self._keyPrefix);
+      parser.push(...prefix);
+      script.parseCommand(parser, ...args)
+
+      return this._executeScript(script, parser, this._commandOptions, transformReply);
+    }
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  static #SingleEntryCache = new SingleEntryCache<any, any>()
+
+  static factory<
+    M extends RedisModules = {},
+    F extends RedisFunctions = {},
+    S extends RedisScripts = {},
+    RESP extends RespVersions = 3
+  >(config?: CommanderConfig<M, F, S, RESP>) {
+
+
+    let Client = RedisClient.#SingleEntryCache.get(config);
+    if (!Client) {
+      Client = attachConfig({
+        BaseClass: RedisClient,
+        commands: COMMANDS,
+        createCommand: RedisClient.#createCommand,
+        createModuleCommand: RedisClient.#createModuleCommand,
+        createFunctionCommand: RedisClient.#createFunctionCommand,
+        createScriptCommand: RedisClient.#createScriptCommand,
+        config
+      });
+
+      Client.prototype.Multi = RedisClientMultiCommand.extend(config);
+
+      RedisClient.#SingleEntryCache.set(config, Client);
+    }
+
+    return <TYPE_MAPPING extends TypeMapping = {}>(
+      options?: Omit<RedisClientOptions<M, F, S, RESP, TYPE_MAPPING>, keyof Exclude<typeof config, undefined>>
+    ) => {
+      // returning a "proxy" to prevent the namespaces._self to leak between "proxies"
+      return Object.create(new Client(options)) as RedisClientType<M, F, S, RESP, TYPE_MAPPING>;
+    };
+  }
+
+  static create<
+    M extends RedisModules = {},
+    F extends RedisFunctions = {},
+    S extends RedisScripts = {},
+    RESP extends RespVersions = 3,
+    TYPE_MAPPING extends TypeMapping = {}
+  >(this: void, options?: RedisClientOptions<M, F, S, RESP, TYPE_MAPPING>) {
+    return RedisClient.factory(options)(options);
+  }
+
+  static parseOptions<O extends AnyRedisClientOptions>(options: O): O {
+    if (options?.url) {
+      const parsed = RedisClient.parseURL(options.url);
+      if (options.socket) {
+        if (options.socket.tls !== undefined && options.socket.tls !== parsed.socket.tls) {
+          throw new TypeError(`tls socket option is set to ${options.socket.tls} which is mismatch with protocol or the URL ${options.url} passed`)
+        }
+        parsed.socket = Object.assign(options.socket, parsed.socket);
+      }
+
+      Object.assign(options, parsed);
+    }
+    return options;
+  }
+
+  static parseURL(url: string): AnyRedisClientOptions & {
+    socket: Exclude<AnyRedisClientOptions['socket'], undefined> & {
+      tls: boolean
+    }
+  } {
+    // unix:// URIs use a non-special scheme; WHATWG URL refuses to parse an
+    // authority (e.g. `user:pass@`) without a host, so handle it separately.
+    if (url.startsWith('unix:')) {
+      return RedisClient.#parseUnixURL(url);
+    }
+
+    // https://www.iana.org/assignments/uri-schemes/prov/redis
+    const { hostname, port, protocol, username, password, pathname } = new URL(url),
+      parsed: AnyRedisClientOptions & {
+        socket: Exclude<AnyRedisClientOptions['socket'], undefined> & {
+          tls: boolean
+        }
+      } = {
+        socket: {
+          // Use net.SocketAddress.parse() once supported.
+          host: hostname.replace(/^\[([0-9a-f:]+)\]$/, '$1'),
+          tls: false
+        }
+      };
+
+    if (protocol !== 'redis:' && protocol !== 'rediss:') {
+      throw new TypeError(`Protocol - ${protocol} - is not a valid Redis protocol. Expected redis: or rediss:`);
+    }
+
+    parsed.socket.tls = protocol === 'rediss:';
+
+    if (port) {
+      (parsed.socket as TcpSocketConnectOpts).port = Number(port);
+    }
+
+    if (username) {
+      parsed.username = decodeURIComponent(username);
+    }
+
+    if (password) {
+      parsed.password = decodeURIComponent(password);
+    }
+
+    if (username || password) {
+      parsed.credentialsProvider = {
+        type: 'async-credentials-provider',
+        credentials: async () => (
+          {
+            username: username ? decodeURIComponent(username) : undefined,
+            password: password ? decodeURIComponent(password) : undefined
+          })
+      };
+    }
+
+    if (pathname.length > 1) {
+      const database = Number(pathname.substring(1));
+      if (isNaN(database)) {
+        throw new TypeError('Invalid pathname');
+      }
+
+      parsed.database = database;
+    }
+
+    return parsed;
+  }
+
+  static #parseUnixURL(url: string): AnyRedisClientOptions & {
+    socket: Exclude<AnyRedisClientOptions['socket'], undefined> & {
+      tls: boolean
+    }
+  } {
+    // unix://[user[:password]@]/path/to/sock[?db=N]
+    const match = /^unix:\/\/(?:([^:@/]*)(?::([^@/]*))?@)?(\/[^?#]*)(?:\?([^#]*))?(?:#.*)?$/.exec(url);
+    if (!match || match[3] === '/') {
+      throw new TypeError('Invalid unix URL');
+    }
+
+    const [, username, password, rawPath, rawQuery] = match,
+      parsed: AnyRedisClientOptions & {
+        socket: Exclude<AnyRedisClientOptions['socket'], undefined> & {
+          tls: boolean
+        }
+      } = {
+        socket: {
+          path: decodeURIComponent(rawPath),
+          tls: false
+        }
+      };
+
+    if (username) {
+      parsed.username = decodeURIComponent(username);
+    }
+
+    if (password) {
+      parsed.password = decodeURIComponent(password);
+    }
+
+    if (username || password) {
+      parsed.credentialsProvider = {
+        type: 'async-credentials-provider',
+        credentials: async () => (
+          {
+            username: username ? decodeURIComponent(username) : undefined,
+            password: password ? decodeURIComponent(password) : undefined
+          })
+      };
+    }
+
+    if (rawQuery) {
+      const db = new URLSearchParams(rawQuery).get('db');
+      if (db !== null) {
+        const database = Number(db);
+        if (isNaN(database)) {
+          throw new TypeError('Invalid db query parameter');
+        }
+        parsed.database = database;
+      }
+    }
+
+    return parsed;
+  }
+
+  readonly #options: RedisClientOptions<M, F, S, RESP, TYPE_MAPPING>;
+  #socket: RedisSocket;
+  readonly #queue: RedisCommandsQueue;
+  #selectedDB = 0;
+  #monitorCallback?: MonitorCallback<TYPE_MAPPING>;
+  private _self = this;
+  private _commandOptions?: CommandOptions<TYPE_MAPPING>;
+  // flag used to annotate that the client
+  // was in a watch transaction when
+  // a topology change occurred
+  #dirtyWatch?: string;
+  #watchEpoch?: number;
+  #clientSideCache?: ClientSideCacheProvider;
+  // What the user registered on the logical client (shared across pooled/cluster/sentinel
+  // clients via the himportRegistry option) vs. what THIS socket's server session holds.
+  #himportRegistry: FieldsetRegistry;
+  #preparedFieldsets = new PreparedFieldsets();
+  #credentialsSubscription: Disposable | null = null;
+  // Flag used to pause writing to the socket during maintenance windows.
+  // When true, prevents new commands from being written while waiting for:
+  // 1. New socket to be ready after maintenance redirect
+  // 2. In-flight commands on the old socket to complete
+  #paused = false;
+  #clientIdentity: ClientIdentity;
+  #registered = false;
+
+  get clientSideCache() {
+    return this._self.#clientSideCache;
+  }
+
+  get options(): RedisClientOptions<M, F, S, RESP> {
+    return this._self.#options;
+  }
+
+  /**
+   * The configured key prefix (see {@link RedisClientOptions.keyPrefix}), if any.
+   * @internal
+   */
+  get _keyPrefix(): RedisArgument | undefined {
+    return this._self.#options.keyPrefix;
+  }
+
+  /**
+   * @internal
+   * Returns the client ID for metrics attribution.
+   */
+  get _clientId(): string {
+    return this._self.#clientIdentity.id;
+  }
+
+  /**
+   * @internal
+   * Sets the client identity. Used by pool/cluster/sentinel when creating child clients.
+   */
+  _setIdentity(role: ClientRole, parentId?: string): void {
+    this._self.#clientIdentity.role = role;
+
+    if (parentId) {
+      this._self.#clientIdentity.parentId = parentId;
+    }
+  }
+
+  /**
+   * @internal
+   * Creates a metrics handle for this client.
+   */
+  #createMetricsHandle(): ClientMetricsHandle {
+    return {
+      identity: this._self.#clientIdentity,
+      getAttributes: () => ({
+        host: this._self.#socket.host,
+        port: this._self.#socket.port,
+        db: this._self.#selectedDB,
+        clientId: this._self.#clientIdentity.id,
+        parentId: this._self.#clientIdentity.parentId,
+        isPubSub: this._self.#queue.isPubSubActive,
+      }),
+      getPendingRequests: () => this._self.#queue.pendingCount,
+      getCacheItemCount: () => this._self.#clientSideCache?.size() ?? 0,
+      isConnected: () => this._self.#socket.isReady
+    };
+  }
+
+  /**
+   * @internal
+   * Registers this client with the metrics registry.
+   */
+  #registerForMetrics(): void {
+    if (this.#registered) {
+      return;
+    }
+    ClientRegistry.instance.register(this.#createMetricsHandle());
+    this.#registered = true;
+  }
+
+  /**
+   * @internal
+   * Unregisters this client from the metrics registry.
+   */
+  #unregisterFromMetrics(): void {
+    if (!this.#registered) return;
+    ClientRegistry.instance.unregister(this.#clientIdentity.id);
+    this.#registered = false;
+  }
+
+  get isOpen(): boolean {
+    return this._self.#socket.isOpen;
+  }
+
+  get isReady(): boolean {
+    return this._self.#socket.isReady;
+  }
+
+  get isPubSubActive() {
+    return this._self.#queue.isPubSubActive;
+  }
+
+  get socketEpoch() {
+    return this._self.#socket.socketEpoch;
+  }
+
+  get isWatching() {
+    return this._self.#watchEpoch !== undefined;
+  }
+
+  /**
+   * Indicates whether the client's WATCH command has been invalidated by a topology change.
+   * When this returns true, any transaction using WATCH will fail with a WatchError.
+   * @returns true if the watched keys have been modified, false otherwise
+   */
+  get isDirtyWatch(): boolean {
+    return this._self.#dirtyWatch !== undefined
+  }
+
+  /**
+   * Marks the client's WATCH command as invalidated due to a topology change.
+   * This will cause any subsequent EXEC in a transaction to fail with a WatchError.
+   * @param msg - The error message explaining why the WATCH is dirty
+   */
+  setDirtyWatch(msg: string) {
+    this._self.#dirtyWatch = msg;
+  }
+
+  constructor(options?: RedisClientOptions<M, F, S, RESP, TYPE_MAPPING>) {
+    super();
+    this.#validateOptions(options)
+    this.#options = this.#initiateOptions(options);
+
+    const socketOpts = this.#options.socket as { host?: string; port?: number } | undefined;
+    this.#clientIdentity = {
+      id: generateClientId(socketOpts?.host, socketOpts?.port, this.#selectedDB),
+      role: ClientRole.STANDALONE
+    };
+
+    this.#queue = this.#initiateQueue(this.#clientIdentity.id);
+    this.#socket = this.#initiateSocket(this.#clientIdentity.id);
+    this.#himportRegistry = this.#options.himportRegistry ?? new FieldsetRegistry();
+
+    this.#registerForMetrics();
+
+    if(this.#options.maintNotifications !== 'disabled') {
+      new EnterpriseMaintenanceManager(this.#queue, this, this.#options);
+    };
+
+    if (this.#options.clientSideCache) {
+      if (this.#options.clientSideCache instanceof ClientSideCacheProvider) {
+        this.#clientSideCache = this.#options.clientSideCache;
+      } else {
+        const cscConfig = this.#options.clientSideCache;
+        this.#clientSideCache = new BasicClientSideCache(cscConfig);
+      }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      this.#queue.addPushHandler((push: Array<any>): boolean => {
+        if (push[0].toString() !== 'invalidate') return false;
+
+        if (push[1] !== null) {
+          for (const key of push[1]) {
+            this.#clientSideCache?.invalidate(key)
+          }
+        } else {
+          this.#clientSideCache?.invalidate(null)
+        }
+
+        return true
+      });
+    } else if (options?.emitInvalidate) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      this.#queue.addPushHandler((push: Array<any>): boolean => {
+        if (push[0].toString() !== 'invalidate') return false;
+
+        if (push[1] !== null) {
+          for (const key of push[1]) {
+            this.emit('invalidate', key);
+          }
+        } else {
+          this.emit('invalidate', null);
+        }
+        return true
+      });
+    }
+  }
+
+  #validateOptions(options?: RedisClientOptions<M, F, S, RESP, TYPE_MAPPING>) {
+    const resp = options?.RESP ?? DEFAULT_RESP;
+    if (options?.clientSideCache && resp !== 3) {
+      throw new Error('Client Side Caching is only supported with RESP3');
+    }
+    if (options?.emitInvalidate && resp !== 3) {
+      throw new Error('emitInvalidate is only supported with RESP3');
+    }
+    if (options?.clientSideCache && options?.emitInvalidate) {
+      throw new Error('emitInvalidate is not supported (or necessary) when clientSideCache is enabled');
+    }
+    if (options?.maintNotifications && options?.maintNotifications !== 'disabled' && resp !== 3) {
+      throw new Error('Graceful Maintenance is only supported with RESP3');
+    }
+  }
+
+  #initiateOptions(options: RedisClientOptions<M, F, S, RESP, TYPE_MAPPING> = {}): RedisClientOptions<M, F, S, RESP, TYPE_MAPPING> {
+
+    // Convert username/password to credentialsProvider if no credentialsProvider is already in place
+    if (!options.credentialsProvider && (options.username || options.password)) {
+
+      options.credentialsProvider = {
+        type: 'async-credentials-provider',
+        credentials: async () => ({
+          username: options.username,
+          password: options.password
+        })
+      };
+    }
+
+    if (options.database) {
+      this._self.#selectedDB = options.database;
+    }
+
+    this._commandOptions = { timeout: DEFAULT_COMMAND_TIMEOUT, ...options.commandOptions };
+
+    if(options.maintNotifications !== 'disabled') {
+      EnterpriseMaintenanceManager.setupDefaultMaintOptions(options);
+    }
+
+    if (options.url) {
+      const parsedOptions = RedisClient.parseOptions(options);
+      if (parsedOptions?.database) {
+        this._self.#selectedDB = parsedOptions.database;
+      }
+      return parsedOptions;
+    }
+
+    return options;
+  }
+
+  #initiateQueue(clientId: string): RedisCommandsQueue {
+    return new RedisCommandsQueue(
+      this.#options.RESP ?? DEFAULT_RESP,
+      this.#options.commandsQueueMaxLength,
+      (channel, listeners) => this.emit('sharded-channel-moved', channel, listeners),
+      clientId
+    );
+  }
+
+  /**
+   * @param credentials
+   */
+  private reAuthenticate = async (credentials: BasicAuth) => {
+    // Re-authentication is not supported on RESP2 with PubSub active
+    if (!(this.isPubSubActive && (this.#options.RESP ?? DEFAULT_RESP) === 2)) {
+      await this.sendCommand(
+        parseArgs(COMMANDS.AUTH, {
+          username: credentials.username,
+          password: credentials.password ?? ''
+        })
+      );
+    }
+  }
+
+  #subscribeForStreamingCredentials(cp: StreamingCredentialsProvider): Promise<[BasicAuth, Disposable]> {
+    return cp.subscribe({
+      onNext: credentials => {
+        this.reAuthenticate(credentials).catch(error => {
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          cp.onReAuthenticationError(new CredentialsError(errorMessage));
+        });
+
+      },
+      onError: (e: Error) => {
+        const errorMessage = `Error from streaming credentials provider: ${e.message}`;
+        cp.onReAuthenticationError(new UnableToObtainNewCredentialsError(errorMessage));
+      }
+    });
+  }
+
+  async #handshake(chainId: symbol, asap: boolean) {
+    const promises = [];
+    const commandsWithErrorHandlers = await this.#getHandshakeCommands();
+
+    if (asap) commandsWithErrorHandlers.reverse()
+
+    for (const { cmd, errorHandler } of commandsWithErrorHandlers) {
+      promises.push(
+        this.#queue
+          .addCommand(cmd, {
+            chainId,
+            asap
+          })
+          .catch(errorHandler)
+      );
+    }
+    return promises;
+  }
+
+  async #getHandshakeCommands(): Promise<
+    Array<{ cmd: CommandArguments } & { errorHandler?: (err: Error) => void }>
+  > {
+    const commands = [];
+    const cp = this.#options.credentialsProvider;
+    const resp = this.#options.RESP ?? DEFAULT_RESP;
+
+    if (resp !== 2) {
+      const hello: HelloOptions = {};
+
+      if (cp && cp.type === 'async-credentials-provider') {
+        const credentials = await cp.credentials();
+        if (credentials.password) {
+          hello.AUTH = {
+            username: credentials.username ?? 'default',
+            password: credentials.password
+          };
+        }
+      }
+
+      if (cp && cp.type === 'streaming-credentials-provider') {
+        const [credentials, disposable] =
+          await this.#subscribeForStreamingCredentials(cp);
+        this.#credentialsSubscription = disposable;
+
+        if (credentials.password) {
+          hello.AUTH = {
+            username: credentials.username ?? 'default',
+            password: credentials.password
+          };
+        }
+      }
+
+      if (this.#options.name) {
+        hello.SETNAME = this.#options.name;
+      }
+
+      commands.push({ cmd: parseArgs(HELLO, resp, hello) });
+    } else {
+      if (cp && cp.type === 'async-credentials-provider') {
+        const credentials = await cp.credentials();
+
+        if (credentials.username || credentials.password) {
+          commands.push({
+            cmd: parseArgs(COMMANDS.AUTH, {
+              username: credentials.username,
+              password: credentials.password ?? ''
+            })
+          });
+        }
+      }
+
+      if (cp && cp.type === 'streaming-credentials-provider') {
+        const [credentials, disposable] =
+          await this.#subscribeForStreamingCredentials(cp);
+        this.#credentialsSubscription = disposable;
+
+        if (credentials.username || credentials.password) {
+          commands.push({
+            cmd: parseArgs(COMMANDS.AUTH, {
+              username: credentials.username,
+              password: credentials.password ?? ''
+            })
+          });
+        }
+      }
+
+      if (this.#options.name) {
+        commands.push({
+          cmd: parseArgs(COMMANDS.CLIENT_SETNAME, this.#options.name)
+        });
+      }
+    }
+
+    if (this.#selectedDB !== 0) {
+      commands.push({ cmd: ['SELECT', this.#selectedDB.toString()] });
+    }
+
+    if (this.#options.readonly) {
+      commands.push({ cmd: parseArgs(COMMANDS.READONLY) });
+    }
+
+    if (!this.#options.disableClientInfo) {
+      commands.push({
+        cmd: ['CLIENT', 'SETINFO', 'LIB-VER', version],
+        errorHandler: () => {
+          // Client libraries are expected to pipeline this command
+          // after authentication on all connections and ignore failures
+          // since they could be connected to an older version that doesn't support them.
+        }
+      });
+
+      commands.push({
+        cmd: [
+          'CLIENT',
+          'SETINFO',
+          'LIB-NAME',
+          this.#options.clientInfoTag
+            ? `node-redis(${this.#options.clientInfoTag})`
+            : 'node-redis'
+        ],
+        errorHandler: () => {
+          // Client libraries are expected to pipeline this command
+          // after authentication on all connections and ignore failures
+          // since they could be connected to an older version that doesn't support them.
+        }
+      });
+    }
+
+    if (this.#clientSideCache) {
+      commands.push({cmd: this.#clientSideCache.trackingOn()});
+    }
+
+    if (this.#options?.emitInvalidate) {
+      commands.push({cmd: ['CLIENT', 'TRACKING', 'ON']});
+    }
+
+    const maintenanceHandshakeCmd = await EnterpriseMaintenanceManager.getHandshakeCommand(this.#options, this._clientId);
+
+    if(maintenanceHandshakeCmd) {
+      commands.push(maintenanceHandshakeCmd);
+    };
+
+    return commands;
+  }
+
+  #attachListeners(socket: RedisSocket) {
+    socket.on('data', chunk => {
+      let errors: Array<unknown> | undefined;
+      try {
+        errors = this.#queue.decoder.write(chunk);
+      } catch (err) {
+        this.#queue.resetDecoder();
+        this.emit('error', err);
+      }
+      errors?.forEach(err => this.emit('error', err));
+    })
+    .on('error', err => {
+      this.emit('error', err);
+      this.#clientSideCache?.onError();
+      // Session state died with the socket. Cleared HERE (not on re-ready): a hImportSet
+      // issued between disconnect and re-ready would otherwise see a live-looking entry,
+      // skip the PREPARE injection, and replay bare onto the new socket's empty session.
+      this.#preparedFieldsets.clear();
+      if (this.#watchEpoch !== undefined) {
+        this.#dirtyWatch ??= 'Client reconnected after WATCH';
+      }
+      if (this.#socket.isOpen && !this.#options.disableOfflineQueue) {
+        this.#queue.flushWaitingForReply(err);
+      } else {
+        this.#queue.flushAll(err);
+      }
+    })
+    .on('connect', () => this.emit('connect'))
+    .on('ready', () => {
+      this.emit('ready');
+      this.#setPingTimer();
+      this.#maybeScheduleWrite();
+    })
+    .on('reconnecting', () => this.emit('reconnecting'))
+    .on('terminated', cause => this.emit('terminated', cause))
+    .on('drain', () => this.#maybeScheduleWrite())
+    .on('end', () => this.emit('end'));
+  }
+
+  #initiateSocket(clientId: string): RedisSocket {
+    const socketInitiator = async () => {
+      const promises = [],
+        chainId = Symbol('Socket Initiator');
+
+      const resubscribePromise = this.#queue.resubscribe(chainId);
+      resubscribePromise?.catch(error => {
+        if (error.message && error.message.startsWith('MOVED')) {
+          this.emit('__MOVED', this._self.#queue.removeAllPubSubListeners());
+        }
+      });
+      if (resubscribePromise) {
+        promises.push(resubscribePromise);
+      }
+
+      if (this.#monitorCallback) {
+        promises.push(
+          this.#queue.monitor(
+            this.#monitorCallback,
+            {
+              typeMapping: this._commandOptions?.typeMapping,
+              chainId,
+              asap: true
+            }
+          )
+        );
+      }
+
+      promises.push(...(await this.#handshake(chainId, true)));
+
+      if (promises.length) {
+        this.#write();
+        return Promise.all(promises);
+      }
+    };
+
+    const socket = new RedisSocket(
+      socketInitiator,
+      clientId,
+      this.#options.socket,
+    );
+    this.#attachListeners(socket);
+    return socket;
+  }
+
+  #pingTimer?: NodeJS.Timeout;
+
+  #setPingTimer(): void {
+    if (!this.#options.pingInterval || !this.#socket.isReady) return;
+    clearTimeout(this.#pingTimer);
+
+    this.#pingTimer = setTimeout(() => {
+      if (!this.#socket.isReady) return;
+
+      this.sendCommand(['PING'])
+        .then(reply => this.emit('ping-interval', reply))
+        .catch(err => this.emit('error', err))
+        .finally(() => this.#setPingTimer());
+    }, this.#options.pingInterval);
+  }
+
+  withCommandOptions<
+    OPTIONS extends CommandOptions<TYPE_MAPPING>,
+    TYPE_MAPPING extends TypeMapping
+  >(options: OPTIONS) {
+    const proxy = Object.create(this._self);
+    proxy._commandOptions = { ...this._commandOptions, ...options };
+    return proxy as RedisClientType<
+      M,
+      F,
+      S,
+      RESP,
+      TYPE_MAPPING extends TypeMapping ? TYPE_MAPPING : {}
+    >;
+  }
+
+  private _commandOptionsProxy<
+    K extends keyof CommandOptions,
+    V extends CommandOptions[K]
+  >(
+    key: K,
+    value: V
+  ) {
+    const proxy = Object.create(this._self);
+    proxy._commandOptions = { ...this._commandOptions, [key]: value };
+    return proxy as RedisClientType<
+      M,
+      F,
+      S,
+      RESP,
+      K extends 'typeMapping' ? V extends TypeMapping ? V : {} : TYPE_MAPPING
+    >;
+  }
+
+  /**
+   * Override the `typeMapping` command option
+   */
+  withTypeMapping<TYPE_MAPPING extends TypeMapping>(typeMapping: TYPE_MAPPING) {
+    return this._commandOptionsProxy('typeMapping', typeMapping);
+  }
+
+  /**
+   * Override the `abortSignal` command option
+   */
+  withAbortSignal(abortSignal: AbortSignal) {
+    return this._commandOptionsProxy('abortSignal', abortSignal);
+  }
+
+  /**
+   * Override the `asap` command option to `true`
+   */
+  asap() {
+    return this._commandOptionsProxy('asap', true);
+  }
+
+  /**
+   * Create the "legacy" (v3/callback) interface
+   */
+  legacy(): RedisLegacyClientType {
+    return new RedisLegacyClient(
+      this as unknown as RedisClientType<M, F, S>
+    ) as RedisLegacyClientType;
+  }
+
+  /**
+   * Create {@link RedisClientPool `RedisClientPool`} using this client as a prototype
+   */
+  createPool(options?: Partial<RedisPoolOptions>) {
+    return RedisClientPool.create(
+      this._self.#options,
+      options
+    );
+  }
+
+  duplicate<
+    _M extends RedisModules = M,
+    _F extends RedisFunctions = F,
+    _S extends RedisScripts = S,
+    _RESP extends RespVersions = RESP,
+    _TYPE_MAPPING extends TypeMapping = TYPE_MAPPING
+  >(overrides?: Partial<RedisClientOptions<_M, _F, _S, _RESP, _TYPE_MAPPING>>) {
+    return new (Object.getPrototypeOf(this).constructor)({
+      ...this._self.#options,
+      // The options spread only carries the registry if the user originally passed one —
+      // inject the live instance explicitly: a duplicate SHARES the parent's registrations.
+      himportRegistry: this._self.#himportRegistry,
+      commandOptions: this._commandOptions,
+      ...overrides
+    }) as RedisClientType<_M, _F, _S, _RESP, _TYPE_MAPPING>;
+  }
+
+  async connect() {
+    await trace(CHANNELS.TRACE_CONNECT,
+      () => this._self.#socket.connect(),
+      () => ({
+        ...this._self.#socketTraceContext(),
+        clientId: this._self._clientId
+      })
+    );
+    return this as unknown as RedisClientType<M, F, S, RESP, TYPE_MAPPING>;
+  }
+
+  /**
+   * @internal
+   */
+   _ejectSocket(): RedisSocket {
+     const socket = this._self.#socket;
+     // @ts-expect-error null assignment is intentional during eject
+     this._self.#socket = null;
+     socket.removeAllListeners();
+     return socket;
+   }
+
+   /**
+    * @internal
+    */
+   _insertSocket(socket: RedisSocket) {
+     if(this._self.#socket) {
+      this._self._ejectSocket().destroy();
+     }
+     // A swapped-in socket carries a fresh server session with no other observable signal
+     // on this client — the explicit wipe is the only fieldset-invalidation mechanism here.
+     this._self.#preparedFieldsets.clear();
+     if (this._self.#watchEpoch !== undefined) {
+       this._self.#dirtyWatch ??= 'Client reconnected after WATCH';
+     }
+     this._self.#socket = socket;
+     this._self.#attachListeners(this._self.#socket);
+   }
+
+   /**
+    * @internal
+    */
+   _maintenanceUpdate(update: MaintenanceUpdate) {
+     this._self.#socket.setMaintenanceTimeout(update.relaxedSocketTimeout);
+     this._self.#queue.setMaintenanceCommandTimeout(update.relaxedCommandTimeout);
+   }
+
+   /**
+    * @internal
+    */
+   _pause() {
+     this._self.#paused = true;
+   }
+
+   /**
+    * @internal
+    */
+   _unpause() {
+     this._self.#paused = false;
+     this._self.#maybeScheduleWrite();
+   }
+
+   /**
+    * @internal
+    */
+   _handleSmigrated(smigratedEvent: SMigratedEvent) {
+     this._self.emit(SMIGRATED_EVENT, smigratedEvent);
+   }
+
+   /**
+    * @internal
+    */
+   _getQueue(): RedisCommandsQueue {
+     return this._self.#queue;
+   }
+
+  /**
+   * @internal
+   */
+  async _executeCommand(
+    command: Command,
+    parser: CommandParser,
+    commandOptions: CommandOptions<TYPE_MAPPING> | undefined,
+    transformReply: TransformReply | undefined,
+  ) {
+    if (
+      command === HIMPORT_SET || command === HIMPORT_PREPARE ||
+      command === HIMPORT_DISCARD || command === HIMPORT_DISCARDALL
+    ) {
+      return this._self.#executeHimport(this, command, parser, commandOptions, transformReply);
+    }
+
+    const csc = this._self.#clientSideCache;
+    const fn = () => { return this.sendCommand(parser.redisArgs, commandOptions) };
+
+    // Eligibility is only worth computing when caching is enabled — the
+    // metadata lookup decodes the command identifier (Buffer args included)
+    // and must not tax the common no-CSC path.
+    const meta = csc ? defaultCommandMetadata.lookup(parser.commandIdentifier) : undefined;
+
+    if (csc) {
+      const defaultTypeMapping = this._self.#options.commandOptions === commandOptions ||
+        (this._self.#options.commandOptions?.typeMapping === commandOptions?.typeMapping);
+
+      // Override-first: a defined `Command.CACHEABLE` wins; otherwise CSC
+      // eligibility derives from the server flags/tips (see `isCacheable`).
+      const eligible = isCacheable(meta, command.CACHEABLE);
+      const mark = commandOptions?.cache;
+
+      // Strict: reject before the send, so the command leaves no side effects behind.
+      // Otherwise the command still executes and nothing is stored; warn on every such call.
+      // TODO: consider removing this warning, or replacing it with a diagnostics channel event.
+      if (!eligible && mark === true) {
+        const error = new ClientSideCacheMarkError(parser.commandIdentifier.command);
+        if (csc.strict) {
+          throw error;
+        }
+        console.warn(error.message);
+      }
+
+      // Intent never makes an ineligible command cacheable. An ASK-redirected
+      // attempt is never stored: ASKING already occupies the one-shot slot the
+      // CLIENT CACHING flag needs.
+      const store = eligible && defaultTypeMapping && !commandOptions?.askRedirect &&
+        csc.resolveCacheIntent(mark, parser.commandIdentifier.command, parser.keys);
+
+      if (store) {
+        if (csc.trackingMode !== CLIENT_SIDE_CACHE_TRACKING_MODES.OPTIN) {
+          return await csc.handleCache(this._self, parser as BasicCommandParser, fn, transformReply, commandOptions?.typeMapping);
+        }
+
+        let storable = true;
+        const cmd = async () => {
+          const result = await this._self.#sendWithCaching(this, 'YES', parser, commandOptions);
+          storable = result.storable;
+          return result.reply;
+        };
+        return await csc.handleCache(this._self, parser as BasicCommandParser, cmd, transformReply, commandOptions?.typeMapping, () => storable);
+      }
+    }
+
+    const reply = csc?.trackingMode === CLIENT_SIDE_CACHE_TRACKING_MODES.OPTOUT && isTrackable(meta) && !commandOptions?.askRedirect ?
+      // A failed NO flag only costs wasted tracking; the reply is never stored here.
+      (await this._self.#sendWithCaching(this, 'NO', parser, commandOptions)).reply :
+      await fn();
+
+    const finalReply = transformReply ? transformReply(reply, parser.preserve, commandOptions?.typeMapping) : reply;
+
+    publish(CHANNELS.COMMAND_REPLY, () => ({ args: sanitizeArgs(parser.redisArgs), reply: finalReply, clientId: this._self._clientId }));
+
+    return finalReply;
+  }
+
+  /**
+   * Sends `CLIENT CACHING <flag>` followed by the read (OPTIN/OPTOUT tracking modes).
+   *
+   * The flag rides as the read's queue prelude, so the two are admitted, cancelled,
+   * encoded, and written as one unit, and both fail if the connection dies after the
+   * write — a flag can never reach the wire without its read.
+   *
+   * `storable` is true only when the flag succeeded: an error reply for the flag means
+   * tracking is unconfirmed, so the reply is returned but must not be cached.
+   */
+  async #sendWithCaching(
+    // The proxy-aware caller, needed for `sendCommand` merging and `_commandOptions`.
+    client: RedisClient<M, F, S, RESP, TYPE_MAPPING>,
+    flag: 'YES' | 'NO',
+    parser: CommandParser,
+    commandOptions: CommandOptions<TYPE_MAPPING> | undefined
+  ) {
+    let storable = false;
+    const reply = await client.sendCommand(parser.redisArgs, {
+      ...commandOptions,
+      prelude: {
+        args: ['CLIENT', 'CACHING', flag],
+        // The flag's reply always arrives before the read's.
+        onReply: err => { storable = err === undefined; }
+      }
+    });
+    return { reply, storable };
+  }
+
+  /**
+   * HIMPORT transparency layer (design: ../himport/registry.ts module doc). Runs instead of
+   * the normal `_executeCommand` tail for the four HIMPORT commands and keeps this
+   * connection's server session coherent with the client-level fieldset registry:
+   *
+   * 1. Reconcile — replays DISCARDs this session missed (it was serving other commands when
+   *    the user discarded on another connection).
+   * 2. Lazy prepare — pipelines a PREPARE in front of a SET when this session lacks the
+   *    fieldset or holds a stale field-list version. No await in between: the server
+   *    processes them in arrival order on one socket.
+   * 3. Registry-based replies — DISCARD/DISCARDALL resolve with the registry mutation result
+   *    (`1`/count of registrations removed), not the per-session server reply, so the answer
+   *    is deterministic across pools and clusters.
+   * 4. Retry-once — a SET failing with `no such fieldset` for a *registered* fieldset means
+   *    this session lost its state through a path the client did not observe; re-prepare on
+   *    this same connection and retry a single time.
+   *
+   * Raw `sendCommand(['HIMPORT', ...])` bypasses this layer by construction.
+   */
+  async #executeHimport(
+    // The proxy-aware caller (`duplicate`d command-options carriers derive from the client),
+    // needed for `sendCommand` merging and `_commandOptions`; `this` inside is always _self.
+    client: RedisClient<M, F, S, RESP, TYPE_MAPPING>,
+    command: Command,
+    parser: CommandParser,
+    commandOptions: CommandOptions<TYPE_MAPPING> | undefined,
+    transformReply: TransformReply | undefined,
+    retried = false
+  ): Promise<unknown> {
+    const registry = this.#himportRegistry;
+    const prepared = this.#preparedFieldsets;
+    const args = parser.redisArgs;
+    // The injected commands must ride with the main command's effective queue placement:
+    // same chainId (ASK-redirect chains flush per chain) and same asap-ness (asap unshifts
+    // to the queue front — a non-asap injection would let an asap SET jump its own PREPARE).
+    const effectiveAsap = commandOptions?.asap ?? client._commandOptions?.asap;
+    const effectiveChainId = commandOptions?.chainId ?? client._commandOptions?.chainId;
+    const injectOpts: CommandOptions = { asap: effectiveAsap, chainId: effectiveChainId };
+
+    // Commands to reach the wire BEFORE the main command, in this order. Each carries the
+    // rollback undoing its optimistic bookkeeping if the server rejects it.
+    const prelude: Array<{ args: Array<RedisArgument>, rollback: () => void, gateMain?: boolean }> = [];
+
+    // -- Reconcile: replay discards this session may still be holding. A DISCARD must
+    // precede a same-name SET on the wire, or the SET would write through the discarded
+    // template; hence prelude, not fire-and-forget.
+    if (prepared.syncedDiscardCount < registry.discardCount) {
+      const countAtInjection = registry.discardCount;
+      const pending = registry.diff(prepared.names());
+      // Every session name is pending → one DISCARDALL wipes the session in a single
+      // command. Safe precisely because nothing this session holds is worth keeping.
+      const collapseToDiscardAll = pending.size > 0 && pending.size === prepared.size;
+      const rollbackVersions = new Map<string, number>();
+      for (const name of pending) {
+        rollbackVersions.set(name, prepared.get(name)!);
+        prepared.delete(name);
+      }
+      prepared.syncedDiscardCount = countAtInjection;
+      // Failed injected DISCARD → the fieldset is still alive on this session with no
+      // client-side trace; restore the trace and knock the synced count back so the next
+      // HIMPORT command re-reconciles. Guarded so a newer PREPARE is never clobbered.
+      const rollback = (names: Iterable<string>) => {
+        for (const name of names) {
+          const version = rollbackVersions.get(name);
+          if (version !== undefined && prepared.get(name) === undefined) {
+            prepared.set(name, version);
+          }
+        }
+        prepared.syncedDiscardCount = Math.min(prepared.syncedDiscardCount, countAtInjection - 1);
+      };
+      if (collapseToDiscardAll) {
+        prelude.push({ args: ['HIMPORT', 'DISCARDALL'], rollback: () => rollback(pending) });
+      } else {
+        for (const name of pending) {
+          prelude.push({ args: ['HIMPORT', 'DISCARD', name], rollback: () => rollback([name]) });
+        }
+      }
+    }
+
+    // -- Per-command registry bookkeeping, optimistic (before any reply) so concurrent
+    // same-tick commands see the final state and don't double-prepare (NF.2).
+    let userPrepare: { name: string, version: number, priorFields: Array<RedisArgument> | undefined } | undefined;
+    let registryReply: number | undefined;
+    let setName: string | undefined;
+    let userDiscard: { restore: Map<string, number>, removed: Map<string, Array<RedisArgument>>, countAfter: number } | undefined;
+
+    if (command === HIMPORT_PREPARE) {
+      const name = String(args[2]);
+      // Snapshot the prior registration BEFORE overwriting it: a rejected *replacement*
+      // PREPARE must restore it (the server keeps the old fieldset on reject), not drop the
+      // name and strand later SETs with `no such fieldset`.
+      const priorFields = registry.get(name)?.fields;
+      registry.set(name, args.slice(3));
+      const version = registry.get(name)!.version;
+      userPrepare = { name, version, priorFields };
+      prepared.set(name, version);
+    } else if (command === HIMPORT_SET) {
+      // args layout: [HIMPORT, SET, key, fieldset, ...values] — index 2 is the (possibly
+      // keyPrefix-affected) key, index 3 is the fieldset name.
+      const name = String(args[3]);
+      setName = name;
+      const entry = registry.get(name);
+      if (entry !== undefined) {
+        const sessionVersion = prepared.get(name);
+        if (sessionVersion === undefined || sessionVersion < entry.version) {
+          prepared.set(name, entry.version);
+          prelude.push({
+            args: ['HIMPORT', 'PREPARE', name, ...entry.fields],
+            // Injected-PREPARE failures are often transient (LOADING, failover) — roll back
+            // only the session claim, never the registration, or a valid fieldset would
+            // permanently lose lazy re-prepare.
+            rollback: () => {
+              if (prepared.get(name) === entry.version) prepared.delete(name);
+            },
+            // Gate the SET reply on this PREPARE: if it fails while the connection stays alive
+            // (e.g. ACL denies PREPARE), the SET would otherwise run against the stale
+            // server-side field list and silently write values under the wrong field names.
+            gateMain: true
+          });
+        }
+      }
+      // Name absent from the registry → send as-is; the server's `no such fieldset` is
+      // authoritative and must not be masked.
+    } else if (command === HIMPORT_DISCARD) {
+      const name = String(args[2]);
+      const sessionVersion = prepared.get(name);
+      // Capture the removed field list so a pre-enqueue failure can re-register it.
+      const priorFields = registry.get(name)?.fields;
+      if (registry.discard(name)) {
+        registryReply = 1;
+        userDiscard = {
+          restore: sessionVersion === undefined ? new Map() : new Map([[name, sessionVersion]]),
+          removed: new Map([[name, priorFields!]]),
+          countAfter: registry.discardCount
+        };
+      } else {
+        registryReply = 0;
+      }
+      prepared.delete(name);
+    } else {
+      const restore = new Map(prepared.entries());
+      // Snapshot all registrations so a pre-enqueue failure can re-register them.
+      const removed = registry.snapshot();
+      registryReply = registry.discardAll();
+      if (registryReply > 0) {
+        userDiscard = { restore, removed, countAfter: registry.discardCount };
+      }
+      prepared.clear();
+    }
+
+    // -- ASK chain: every keyless command in the prelude (a lazy PREPARE or a reconcile
+    // DISCARD) would consume the one-shot ASKING flag that the ASK handler set for this SET,
+    // leaving the SET to be redirected again until maxCommandRedirections. Re-issue ASKING as
+    // the final prelude entry so it lands immediately before the SET on the wire.
+    if (command === HIMPORT_SET && commandOptions?.askRedirect && prelude.length > 0) {
+      prelude.push({ args: [ASKING_CMD], rollback: () => {} });
+    }
+
+    // -- Enqueue. Everything below runs in one synchronous tick, so the prelude and the
+    // main command flush to the socket in a single write (the HLD-blessed pipelining).
+    const send = () => client.sendCommand(parser.redisArgs, commandOptions);
+    // The version-bump PREPARE (if any) whose success the SET reply is gated on.
+    let mainGate: Promise<unknown> | undefined;
+    const enqueue = (injection: { args: Array<RedisArgument>, rollback: () => void, gateMain?: boolean }) => {
+      const promise = client.sendCommand(injection.args, injectOpts);
+      promise.catch(injection.rollback);
+      if (injection.gateMain) mainGate = promise;
+    };
+    let mainPromise: Promise<unknown>;
+    if (effectiveAsap) {
+      // asap unshifts, so consecutive front-insertions reverse: enqueue the main command
+      // first, then the prelude back-to-front — the wire sees prelude order, then main.
+      mainPromise = send();
+      for (let i = prelude.length - 1; i >= 0; i--) {
+        enqueue(prelude[i]);
+      }
+    } else {
+      for (const injection of prelude) {
+        enqueue(injection);
+      }
+      mainPromise = send();
+    }
+
+    let reply: unknown;
+    try {
+      reply = await mainPromise;
+    } catch (err) {
+      if (command === HIMPORT_PREPARE && userPrepare !== undefined) {
+        // Roll back the optimistic registration. Version-guarded: a newer successful PREPARE
+        // that won a race must not be clobbered.
+        //   • Rejected *replacement* (a prior field list existed) — the server keeps the old
+        //     fieldset on reject, so restore it; dropping it would strand later SETs (on
+        //     new/reconnected/pooled connections) with `no such fieldset` even though the last
+        //     successful registration was still valid.
+        //   • Rejected *fresh* PREPARE — remove via discard(), which also bumps discardCount so
+        //     any session still holding a stale claim reconciles it away.
+        const { name, version, priorFields } = userPrepare;
+        if (prepared.get(name) === version) prepared.delete(name);
+        if (registry.get(name)?.version === version) {
+          if (priorFields !== undefined) {
+            registry.set(name, priorFields);
+          } else {
+            registry.discard(name);
+          }
+        }
+      } else if (
+        command === HIMPORT_SET && setName !== undefined && !retried &&
+        (err as Error)?.message?.includes?.('no such fieldset') &&
+        registry.get(setName) !== undefined
+      ) {
+        // Recover-and-retry-once (HLD NF.4): the session claim lied — state was lost through
+        // a path the client did not observe. Blind retries on another connection would fail
+        // identically; re-prepare HERE and retry a single time.
+        prepared.delete(setName);
+        return this.#executeHimport(client, command, parser, commandOptions, transformReply, true);
+      } else if (userDiscard !== undefined) {
+        // A rejected user DISCARD/DISCARDALL, two cases:
+        //   • Pre-enqueue failure (client closed/offline, aborted signal, full queue) — the
+        //     command never reached the server, so the discard did not happen. Re-register the
+        //     removed fieldsets (absence-guarded: a re-PREPARE that won the race keeps its newer
+        //     entry) so shared duplicates/pools keep auto-preparing instead of failing with
+        //     `no such fieldset` on a discard the server never saw.
+        //   • Wire/server failure — this session's server state is unknown while the registry
+        //     mutation stands (a discard is recorded user intent; other sessions reconcile off
+        //     the count bump regardless). The registry stays removed and the synced-count knock
+        //     below makes the next HIMPORT command replay the discard on this session.
+        // Either way, restore this session's optimistically-wiped claims.
+        if (isPreEnqueueError(err)) {
+          for (const [name, fields] of userDiscard.removed) {
+            if (registry.get(name) === undefined) registry.set(name, fields);
+          }
+        }
+        for (const [name, version] of userDiscard.restore) {
+          if (prepared.get(name) === undefined) prepared.set(name, version);
+        }
+        prepared.syncedDiscardCount = Math.min(prepared.syncedDiscardCount, userDiscard.countAfter - 1);
+      }
+      throw err;
+    }
+
+    // The SET succeeded on the wire, but if its version-bump PREPARE was rejected while the
+    // connection stayed alive, the server applied the SET to a STALE field list (the older
+    // version this session still held) — a silent write under the wrong field names. Surface
+    // the PREPARE error instead of the misleading OK, and drop the now-unreliable session claim
+    // so the next SET re-prepares. (The `.catch(rollback)` already cleared the optimistic claim;
+    // this delete is idempotent.)
+    if (mainGate !== undefined) {
+      try {
+        await mainGate;
+      } catch (prepareErr) {
+        if (setName !== undefined) prepared.delete(setName);
+        throw prepareErr;
+      }
+    }
+
+    const finalReply = registryReply !== undefined
+      ? registryReply
+      : transformReply ? transformReply(reply, parser.preserve, commandOptions?.typeMapping) : reply;
+
+    publish(CHANNELS.COMMAND_REPLY, () => ({ args: sanitizeArgs(parser.redisArgs), reply: finalReply, clientId: this._clientId }));
+
+    return finalReply;
+  }
+
+  /**
+   * @internal
+   */
+  async _executeScript(
+    script: RedisScript,
+    parser: CommandParser,
+    options: CommandOptions | undefined,
+    transformReply: TransformReply | undefined,
+  ) {
+    const args = parser.redisArgs as Array<RedisArgument>;
+
+    let reply: ReplyUnion;
+    try {
+      reply = await this.sendCommand(args, options);
+    } catch (err) {
+      if (!(err as Error)?.message?.startsWith?.('NOSCRIPT')) throw err;
+
+      args[0] = 'EVAL';
+      args[1] = script.SCRIPT;
+      reply = await this.sendCommand(args, options);
+    }
+
+    return transformReply ?
+      transformReply(reply, parser.preserve, options?.typeMapping) :
+      reply;
+  }
+
+  sendCommand<T = ReplyUnion>(
+    args: ReadonlyArray<RedisArgument>,
+    options?: CommandOptions
+  ): Promise<T> {
+    return trace(CHANNELS.TRACE_COMMAND,
+      () => {
+        if (!this._self.#socket.isOpen) {
+          return Promise.reject(new ClientClosedError());
+        } else if (
+          !this._self.#socket.isReady &&
+          this._self.#options.disableOfflineQueue
+        ) {
+          return Promise.reject(new ClientOfflineError());
+        }
+
+        if (this._self.#clientSideCache) {
+          const command = cscManagedCommand(args);
+          if (command) return Promise.reject(new ClientSideCacheCommandError(command));
+        }
+
+        // Merge global options with provided options
+        const opts = {
+          ...this._commandOptions,
+          ...options,
+        };
+
+        const promise = this._self.#queue.addCommand<T>(args, opts);
+        this._self.#scheduleWrite();
+        return promise;
+      },
+      () => this._self.#commandTraceContext(args)
+    );
+  }
+
+  #commandTraceContext(args: ReadonlyArray<RedisArgument>): CommandTraceContext {
+    return {
+      command: String(args[0]).toUpperCase(),
+      args: sanitizeArgs(args),
+      database: this.#selectedDB,
+      clientId: this._clientId,
+      ...this.#socketTraceContext()
+    };
+  }
+
+  #socketTraceContext(): { serverAddress: string; serverPort: number | undefined } {
+    const socketOptions = this.#options.socket;
+    if (socketOptions && 'path' in socketOptions) {
+      return { serverAddress: socketOptions.path as string, serverPort: undefined };
+    }
+    return {
+      serverAddress: socketOptions?.host ?? 'localhost',
+      serverPort: socketOptions?.port ?? 6379
+    };
+  }
+
+  async SELECT(db: number): Promise<void> {
+    await this.sendCommand(['SELECT', db.toString()]);
+    this._self.#selectedDB = db;
+  }
+
+  select = this.SELECT;
+
+  #pubSubCommand<T>(promise: Promise<T> | undefined) {
+    if (promise === undefined) return Promise.resolve();
+
+    this.#scheduleWrite();
+    return promise;
+  }
+
+  SUBSCRIBE<T extends boolean = false>(
+    channels: string | Array<string>,
+    listener: PubSubListener<T>,
+    bufferMode?: T
+  ): Promise<void> {
+    return this._self.#pubSubCommand(
+      this._self.#queue.subscribe(
+        PUBSUB_TYPE.CHANNELS,
+        channels,
+        listener,
+        bufferMode
+      )
+    );
+  }
+
+  subscribe = this.SUBSCRIBE;
+
+  UNSUBSCRIBE<T extends boolean = false>(
+    channels?: string | Array<string>,
+    listener?: PubSubListener<T>,
+    bufferMode?: T
+  ): Promise<void> {
+    return this._self.#pubSubCommand(
+      this._self.#queue.unsubscribe(
+        PUBSUB_TYPE.CHANNELS,
+        channels,
+        listener,
+        bufferMode
+      )
+    );
+  }
+
+  unsubscribe = this.UNSUBSCRIBE;
+
+  PSUBSCRIBE<T extends boolean = false>(
+    patterns: string | Array<string>,
+    listener: PubSubListener<T>,
+    bufferMode?: T
+  ): Promise<void> {
+    return this._self.#pubSubCommand(
+      this._self.#queue.subscribe(
+        PUBSUB_TYPE.PATTERNS,
+        patterns,
+        listener,
+        bufferMode
+      )
+    );
+  }
+
+  pSubscribe = this.PSUBSCRIBE;
+
+  PUNSUBSCRIBE<T extends boolean = false>(
+    patterns?: string | Array<string>,
+    listener?: PubSubListener<T>,
+    bufferMode?: T
+  ): Promise<void> {
+    return this._self.#pubSubCommand(
+      this._self.#queue.unsubscribe(
+        PUBSUB_TYPE.PATTERNS,
+        patterns,
+        listener,
+        bufferMode
+      )
+    );
+  }
+
+  pUnsubscribe = this.PUNSUBSCRIBE;
+
+  SSUBSCRIBE<T extends boolean = false>(
+    channels: string | Array<string>,
+    listener: PubSubListener<T>,
+    bufferMode?: T
+  ): Promise<void> {
+    return this._self.#pubSubCommand(
+      this._self.#queue.subscribe(
+        PUBSUB_TYPE.SHARDED,
+        channels,
+        listener,
+        bufferMode
+      )
+    );
+  }
+
+  sSubscribe = this.SSUBSCRIBE;
+
+  SUNSUBSCRIBE<T extends boolean = false>(
+    channels?: string | Array<string>,
+    listener?: PubSubListener<T>,
+    bufferMode?: T
+  ): Promise<void> {
+    return this._self.#pubSubCommand(
+      this._self.#queue.unsubscribe(
+        PUBSUB_TYPE.SHARDED,
+        channels,
+        listener,
+        bufferMode
+      )
+    );
+  }
+
+  sUnsubscribe = this.SUNSUBSCRIBE;
+
+  async WATCH(key: RedisVariadicArgument) {
+    // WATCH builds its arguments outside of the command parser, so the configured
+    // `keyPrefix` must be applied here too — otherwise WATCH would guard the unprefixed
+    // key while the transaction operates on the prefixed one, silently breaking the
+    // optimistic lock.
+    const reply = await this._self.sendCommand(
+      ['WATCH', ...prefixKeys(this._self._keyPrefix, key)]
+    );
+    this._self.#watchEpoch ??= this._self.socketEpoch;
+    return reply as unknown as ReplyWithTypeMapping<SimpleStringReply<'OK'>, TYPE_MAPPING>;
+  }
+
+  watch = this.WATCH;
+
+  async UNWATCH() {
+    const reply = await this._self.sendCommand(['UNWATCH']);
+    this._self.#dirtyWatch = undefined;
+    this._self.#watchEpoch = undefined;
+    return reply as unknown as ReplyWithTypeMapping<SimpleStringReply<'OK'>, TYPE_MAPPING>;
+  }
+
+  unwatch = this.UNWATCH;
+
+  getPubSubListeners(type: PubSubType) {
+    return this._self.#queue.getPubSubListeners(type);
+  }
+
+  extendPubSubChannelListeners(
+    type: PubSubType,
+    channel: string,
+    listeners: ChannelListeners
+  ) {
+    return this._self.#pubSubCommand(
+      this._self.#queue.extendPubSubChannelListeners(type, channel, listeners)
+    );
+  }
+
+  extendPubSubListeners(type: PubSubType, listeners: PubSubTypeListeners) {
+    return this._self.#pubSubCommand(
+      this._self.#queue.extendPubSubListeners(type, listeners)
+    );
+  }
+
+  #write() {
+    if(this.#paused) {
+      return
+    }
+    this.#socket.write(this.#queue.commandsToWrite());
+  }
+
+  #scheduledWrite?: NodeJS.Immediate;
+
+  #scheduleWrite() {
+    if (!this.#socket.isReady || this.#scheduledWrite) return;
+
+    this.#scheduledWrite = setImmediate(() => {
+      this.#write();
+      this.#scheduledWrite = undefined;
+    });
+  }
+
+  #maybeScheduleWrite() {
+    if (!this.#queue.isWaitingToWrite()) return;
+
+    this.#scheduleWrite();
+  }
+
+  /**
+   * @internal
+   */
+  async _executePipeline(
+    commands: Array<RedisMultiQueuedCommand>,
+    selectedDB?: number,
+    slotNumber?: number
+  ) {
+    assertNoHimportSessionCommands(commands);
+    if (this._self.#clientSideCache) assertNoCscManagedCommands(commands);
+
+    if (!this._self.#socket.isOpen) {
+      return Promise.reject(new ClientClosedError());
+    }
+
+    const batchSize = commands.length;
+
+    return trace(CHANNELS.TRACE_BATCH,
+      async () => {
+        const chainId = Symbol('Pipeline Chain');
+        const promise = Promise.all(
+          commands.map(({ args }) => {
+            const traced = trace(CHANNELS.TRACE_COMMAND,
+              () => this._self.#queue.addCommand(args, {
+                chainId,
+                typeMapping: this._commandOptions?.typeMapping,
+                slotNumber
+              }),
+              () => ({
+                ...this._self.#commandTraceContext(args),
+                batchMode: 'PIPELINE' as const,
+                batchSize
+              })
+            );
+            // Prevent unhandled rejection from tracePromise wrapper; individual
+            // rejections are collected by Promise.all, but the tracePromise wrapper
+            // is a separate branch that nobody awaits.
+            traced.catch(noop);
+            if (String(args[0]).toUpperCase() === 'SELECT') {
+              traced.then(() => {
+                this._self.#selectedDB = Number(args[1]);
+              }, noop);
+            }
+            return traced;
+          })
+        );
+        this._self.#scheduleWrite();
+
+        const result = await promise;
+
+        return result;
+      },
+      () => ({
+        batchMode: 'PIPELINE' as const,
+        batchSize,
+        database: this._self.#selectedDB,
+        clientId: this._self._clientId,
+        ...this._self.#socketTraceContext()
+      })
+    );
+  }
+
+  /**
+   * @internal
+   */
+  async _executeMulti(
+    commands: Array<RedisMultiQueuedCommand>,
+    selectedDB?: number,
+    slotNumber?: number,
+    chainId = Symbol('MULTI Chain')
+  ) {
+    assertNoHimportSessionCommands(commands);
+    if (this._self.#clientSideCache) assertNoCscManagedCommands(commands);
+
+    // Admit MULTI + commands + EXEC as one unit. Partial admission leaves the
+    // server inside MULTI (later commands answer QUEUED) — see #3502.
+    // Checked before the WATCH state is consumed, so a rejected batch keeps it.
+    if (!this._self.#queue.hasCapacity(commands.length + 2)) {
+      throw new Error('The queue is full');
+    }
+
+    const dirtyWatch = this._self.#dirtyWatch;
+    this._self.#dirtyWatch = undefined;
+    const watchEpoch = this._self.#watchEpoch;
+    this._self.#watchEpoch = undefined;
+
+    if (!this._self.#socket.isOpen) {
+      throw new ClientClosedError();
+    }
+
+    if (dirtyWatch) {
+      throw new WatchError(dirtyWatch);
+    }
+
+    if (watchEpoch && watchEpoch !== this._self.socketEpoch) {
+      throw new WatchError('Client reconnected after WATCH');
+    }
+
+    const batchSize = commands.length;
+
+    return trace(CHANNELS.TRACE_BATCH,
+      async () => {
+        const typeMapping = this._commandOptions?.typeMapping;
+        const promises: Array<Promise<unknown>> = [
+          this._self.#queue.addCommand(['MULTI'], { chainId, slotNumber }),
+        ];
+
+        for (const { args } of commands) {
+          promises.push(
+            this._self.#queue.addCommand(args, {
+              chainId,
+              typeMapping,
+              slotNumber
+            })
+          );
+        }
+
+        promises.push(
+          this._self.#queue.addCommand(['EXEC'], { chainId, slotNumber })
+        );
+
+        this._self.#scheduleWrite();
+
+        const results = await Promise.all(promises),
+          execResult = results[results.length - 1];
+
+        if (execResult === null) {
+          throw new WatchError();
+        }
+
+        commands.forEach(({ args }, i) => {
+          if (String(args[0]).toUpperCase() === 'SELECT' && !((execResult as Array<unknown>)[i] instanceof ErrorReply)) {
+            this._self.#selectedDB = Number(args[1]);
+          }
+        });
+
+        return execResult as Array<unknown>;
+      },
+      () => ({
+        batchMode: 'MULTI' as const,
+        batchSize,
+        database: this._self.#selectedDB,
+        clientId: this._self._clientId,
+        ...this._self.#socketTraceContext()
+      })
+    );
+  }
+
+  MULTI<isTyped extends MultiMode = MULTI_MODE['TYPED']>() {
+    type Multi = new (...args: ConstructorParameters<typeof RedisClientMultiCommand>) => RedisClientMultiCommandType<isTyped, [], M, F, S, RESP, TYPE_MAPPING>;
+    return new ((this as unknown as { Multi: Multi }).Multi)(
+      this._executeMulti.bind(this),
+      this._executePipeline.bind(this),
+      this._commandOptions?.typeMapping,
+      this._self._keyPrefix
+    );
+  }
+
+  multi = this.MULTI;
+
+  /**
+   * Async iterator over the keyspace, issuing paged `SCAN` calls and yielding one array
+   * of keys per page until the cursor returns to `0`.
+   *
+   * @remarks
+   * With a configured {@link RedisClientOptions.keyPrefix}, the yielded keys are the
+   * **already-prefixed** keys as stored on the server — replies are never un-prefixed.
+   * Passing them straight back into a key-prefixed command prefixes them a second time
+   * (e.g. with `keyPrefix: 'app:'`, a yielded `'app:foo'` becomes `'app:app:foo'`):
+   *
+   * ```js
+   * for await (const keys of client.scanIterator()) {
+   *   await client.mGet(keys); // ⚠️ double-prefixes -> reads 'app:app:foo'
+   * }
+   * ```
+   *
+   * Strip the prefix before reusing the keys, or read them with a client that has no
+   * `keyPrefix`.
+   */
+  async* scanIterator(
+    this: RedisClientType<M, F, S, RESP, TYPE_MAPPING>,
+    options?: ScanOptions & ScanIteratorOptions
+  ) {
+    let cursor = options?.cursor ?? '0';
+    do {
+      const reply = await this.scan(cursor, options);
+      cursor = reply.cursor;
+      yield reply.keys;
+      // Cursor may be a Buffer when a Blob String type mapping is in use;
+      // compare by string value so iteration actually terminates.
+    } while (cursor.toString() !== '0');
+  }
+
+  async* hScanIterator(
+    this: RedisClientType<M, F, S, RESP, TYPE_MAPPING>,
+    key: RedisArgument,
+    options?: ScanCommonOptions & ScanIteratorOptions
+  ) {
+    let cursor = options?.cursor ?? '0';
+    do {
+      const reply = await this.hScan(key, cursor, options);
+      cursor = reply.cursor;
+      yield reply.entries;
+    } while (cursor.toString() !== '0');
+  }
+
+  async* hScanValuesIterator(
+    this: RedisClientType<M, F, S, RESP, TYPE_MAPPING>,
+    key: RedisArgument,
+    options?: ScanCommonOptions & ScanIteratorOptions
+  ) {
+    let cursor = options?.cursor ?? '0';
+    do {
+      const reply = await this.hScan(key, cursor, options);
+      cursor = reply.cursor;
+      yield reply.entries.map(entry => entry.value);
+    } while (cursor.toString() !== '0');
+  }
+
+  async* hScanNoValuesIterator(
+    this: RedisClientType<M, F, S, RESP, TYPE_MAPPING>,
+    key: RedisArgument,
+    options?: ScanCommonOptions & ScanIteratorOptions
+  ) {
+    let cursor = options?.cursor ?? '0';
+    do {
+      const reply = await this.hScanNoValues(key, cursor, options);
+      cursor = reply.cursor;
+      yield reply.fields;
+    } while (cursor.toString() !== '0');
+  }
+
+  async* sScanIterator(
+    this: RedisClientType<M, F, S, RESP, TYPE_MAPPING>,
+    key: RedisArgument,
+    options?: ScanCommonOptions & ScanIteratorOptions
+  ) {
+    let cursor = options?.cursor ?? '0';
+    do {
+      const reply = await this.sScan(key, cursor, options);
+      cursor = reply.cursor;
+      yield reply.members;
+    } while (cursor.toString() !== '0');
+  }
+
+  async* zScanIterator(
+    this: RedisClientType<M, F, S, RESP, TYPE_MAPPING>,
+    key: RedisArgument,
+    options?: ScanCommonOptions & ScanIteratorOptions
+  ) {
+    let cursor = options?.cursor ?? '0';
+    do {
+      const reply = await this.zScan(key, cursor, options);
+      cursor = reply.cursor;
+      yield reply.members;
+    } while (cursor.toString() !== '0');
+  }
+
+  async MONITOR(callback: MonitorCallback<TYPE_MAPPING>) {
+    const promise = this._self.#queue.monitor(callback, {
+      typeMapping: this._commandOptions?.typeMapping
+    });
+    this._self.#scheduleWrite();
+    await promise;
+    this._self.#monitorCallback = callback;
+  }
+
+  monitor = this.MONITOR;
+
+  /**
+   * Reset the client to its default state (i.e. stop PubSub, stop monitoring, select default DB, etc.)
+   */
+  async reset() {
+    // RESET wipes the server session's fieldsets. Cleared at entry, not after the
+    // round-trip: RESET queues at the #toWrite tail, so a concurrent hImportSet whose hook
+    // runs before a post-completion clear would see a live entry and queue a bare SET
+    // BEHIND the RESET — onto the wiped session. With the entry-time clear it re-injects
+    // PREPARE, which queues behind RESET too, in the correct order.
+    this._self.#preparedFieldsets.clear();
+    const chainId = Symbol('Reset Chain'),
+      promises = [this._self.#queue.reset(chainId)],
+      selectedDB = this._self.#options?.database ?? 0;
+    this._self.#credentialsSubscription?.dispose();
+    this._self.#credentialsSubscription = null;
+    this._self.#selectedDB = selectedDB;
+    promises.push(...(await this._self.#handshake(chainId, false)));
+    this._self.#scheduleWrite();
+    await Promise.all(promises);
+    // a select() sent before RESET resolves in between and records its db
+    this._self.#selectedDB = selectedDB;
+    this._self.#monitorCallback = undefined;
+    this._self.#dirtyWatch = undefined;
+    this._self.#watchEpoch = undefined;
+  }
+
+  /**
+   * If the client has state, reset it.
+   * An internal function to be used by wrapper class such as `RedisClientPool`.
+   * @internal
+   */
+  resetIfDirty() {
+    let shouldReset = false;
+    if (this._self.#selectedDB !== (this._self.#options?.database ?? 0)) {
+      console.warn('Returning a client with a different selected DB');
+      shouldReset = true;
+    }
+
+    if (this._self.#monitorCallback) {
+      console.warn('Returning a client with active MONITOR');
+      shouldReset = true;
+    }
+
+    if (this._self.#queue.isPubSubActive) {
+      console.warn('Returning a client with active PubSub');
+      shouldReset = true;
+    }
+
+    if (this._self.#dirtyWatch || this._self.#watchEpoch) {
+      console.warn('Returning a client with active WATCH');
+      shouldReset = true;
+    }
+
+    if (shouldReset) {
+      return this.reset();
+    }
+  }
+
+  /**
+   * @deprecated use .close instead
+   */
+  QUIT(): Promise<string> {
+    this._self.#credentialsSubscription?.dispose();
+    this._self.#credentialsSubscription = null;
+    return this._self.#socket.quit(async () => {
+      clearTimeout(this._self.#pingTimer);
+      const quitPromise = this._self.#queue.addCommand<string>(['QUIT']);
+      this._self.#scheduleWrite();
+      this._self.#unregisterFromMetrics();
+      return quitPromise;
+    });
+  }
+
+  quit = this.QUIT;
+
+  /**
+   * @deprecated use .destroy instead
+   */
+  disconnect() {
+    return Promise.resolve(this.destroy());
+  }
+
+  /**
+   * Close the client. Wait for pending commands.
+   */
+  close() {
+    return new Promise<void>(resolve => {
+      clearTimeout(this._self.#pingTimer);
+      this._self.#socket.close();
+      // See destroy(): only flush the cache if this client ever connected.
+      if (this._self.#socket.socketEpoch > 0) {
+        this._self.#clientSideCache?.onClose();
+      }
+      this._self.#credentialsSubscription?.dispose();
+      this._self.#credentialsSubscription = null;
+
+      if (this._self.#queue.isEmpty()) {
+        this._self.#unregisterFromMetrics();
+        this._self.#socket.destroySocket();
+        return resolve();
+      }
+
+      // A concurrent destroy() can force-kill the draining socket; it tears the socket down
+      // itself and emits `end`, so settle then too — otherwise we would wait forever for a
+      // `data` event that a destroyed socket never delivers, leaking this promise and its
+      // listeners.
+      const onEnd = () => {
+        this._self.#socket.off('data', maybeClose);
+        this._self.#unregisterFromMetrics();
+        resolve();
+      };
+      const maybeClose = () => {
+        if (!this._self.#queue.isEmpty()) return;
+
+        this._self.#socket.off('data', maybeClose);
+        this._self.#socket.off('end', onEnd);
+        this._self.#unregisterFromMetrics();
+        this._self.#socket.destroySocket();
+        resolve();
+      };
+      this._self.#socket.on('data', maybeClose);
+      this._self.#socket.once('end', onEnd);
+    });
+  }
+
+  /**
+   * Destroy the client. Rejects all commands immediately.
+   */
+  destroy() {
+    clearTimeout(this._self.#pingTimer);
+    this._self.#queue.flushAll(new DisconnectsClientError());
+    this._self.#socket.destroy();
+    // Only flush the client-side cache if this client ever connected. A client
+    // that never became ready (e.g. a cluster node whose connect failed
+    // terminally) cached nothing and missed no invalidations, so there is
+    // nothing to go stale — and clearing a pooled cache it shares with healthy
+    // connections would needlessly cold-start them.
+    if (this._self.#socket.socketEpoch > 0) {
+      this._self.#clientSideCache?.onClose();
+    }
+    this._self.#unregisterFromMetrics();
+    this._self.#credentialsSubscription?.dispose();
+    this._self.#credentialsSubscription = null;
+  }
+
+  ref() {
+    this._self.#socket.ref();
+  }
+
+  unref() {
+    this._self.#socket.unref();
+  }
+}

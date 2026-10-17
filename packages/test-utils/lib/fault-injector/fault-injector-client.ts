@@ -1,0 +1,443 @@
+import { setTimeout } from "node:timers/promises";
+
+import {
+  ActionRequest,
+  ActionStatus,
+  ActionTrigger,
+  ListActionTriggersResponse,
+  CreateDatabaseConfig,
+  DatabaseConfig,
+  IFaultInjectorClient,
+  MultiDbFailoverTrigger,
+  MultiDbSetup,
+  MultiDbTopology,
+  TriggerActionOptions,
+} from "./types";
+
+const dbg = (...args: unknown[]) => {
+  console.log(new Date().toISOString().slice(11, 23), "[FI]", ...args);
+};
+
+export class FaultInjectorClient implements IFaultInjectorClient {
+  private baseUrl: string;
+  private dbConfig?: DatabaseConfig
+  #fetch: typeof fetch;
+
+  constructor(baseUrl: string, fetchImpl: typeof fetch = fetch) {
+    this.baseUrl = baseUrl.replace(/\/+$/, ""); // trim trailing slash
+    dbg('Constructor:', this.baseUrl);
+    this.#fetch = fetchImpl;
+  }
+
+  async listActionTriggers(actionName: string, effect: string): Promise<ActionTrigger[]> {
+    const res = await this.#request<ListActionTriggersResponse>("GET", `/${actionName}?effect=${effect}`);
+    dbg('listActionTriggers:', {
+      ...res,
+      triggers: res.triggers.map(trigger => ({
+        ...trigger,
+        requirements: JSON.stringify(trigger.requirements)
+      }))
+    });
+    return res.triggers;
+  }
+
+  selectDbConfig(dbConfig: DatabaseConfig) {
+    this.dbConfig = dbConfig;
+  }
+
+  /**
+   * Lists all available actions.
+   * @throws {Error} When the HTTP request fails or response cannot be parsed as JSON
+   */
+  public listActions<T = unknown>(): Promise<T> {
+    dbg('listActions');
+    return this.#request<T>("GET", "/action");
+  }
+
+  /**
+   * Triggers a specific action.
+   * @param action The action request to trigger
+   * @throws {Error} When the HTTP request fails or response cannot be parsed as JSON
+   */
+  public async triggerAction<T extends { action_id: string }>(
+    action: Readonly<ActionRequest>,
+    options?: {
+      timeoutMs?: number;
+      maxWaitTimeMs?: number;
+    }
+  ): Promise<ActionStatus> {
+    // Create a deep copy to avoid mutating the original action object
+    const actionCopy: ActionRequest = JSON.parse(JSON.stringify(action));
+
+    if (actionCopy.parameters !== undefined && actionCopy.parameters.bdb_id === undefined) {
+      const resolvedBdbId = this.#resolveBdbId();
+      if (resolvedBdbId !== undefined) {
+        dbg('bdb_id was not provided. setting selected bdb_id');
+        actionCopy.parameters.bdb_id = String(resolvedBdbId);
+      }
+    }
+    const params = actionCopy.parameters ? JSON.stringify(actionCopy.parameters) : '';
+    dbg('triggerAction:', actionCopy.type, params);
+    const { action_id } = await this.#request<T>("POST", "/action", actionCopy);
+    dbg('action_id:', action_id);
+
+    return this.waitForAction(action_id, options);
+  }
+
+  /**
+   * Gets the status of a specific action.
+   * @param actionId The ID of the action to check
+   * @throws {Error} When the HTTP request fails or response cannot be parsed as JSON
+   */
+  public getActionStatus<T = ActionStatus>(actionId: string): Promise<T> {
+    return this.#request<T>("GET", `/action/${actionId}`);
+  }
+
+  /**
+   * Waits for an action to complete.
+   * @param actionId The ID of the action to wait for
+   * @param options Optional timeout and max wait time
+   * @throws {Error} When the action does not complete within the max wait time
+   */
+  public async waitForAction(
+    actionId: string,
+    {
+      timeoutMs,
+      maxWaitTimeMs,
+    }: {
+      timeoutMs?: number;
+      maxWaitTimeMs?: number;
+    } = {}
+  ): Promise<ActionStatus> {
+    const timeout = timeoutMs || 1000;
+    const maxWaitTime = maxWaitTimeMs || 60000;
+
+    const startTime = Date.now();
+
+    while (Date.now() - startTime < maxWaitTime) {
+      const action = await this.getActionStatus<ActionStatus>(actionId);
+
+      if (action.status === "failed") {
+        throw new Error(
+          `Action id: ${actionId} failed! Error: ${action.error}`
+        );
+      }
+
+      if (["finished", "success"].includes(action.status)) {
+        dbg(`${actionId} completed: ${action.status}`)
+        return action;
+      }
+
+      await setTimeout(timeout);
+    }
+
+    throw new Error(`Timeout waiting for action ${actionId}`);
+  }
+
+  async migrateAndBindAction({
+    bdbId,
+    clusterIndex,
+  }: {
+    bdbId?: string | number;
+    clusterIndex: string | number;
+  }) {
+    const resolvedBdbId = this.#resolveBdbId(bdbId);
+    dbg('migrateAndBind: bdb', resolvedBdbId, 'cluster', clusterIndex);
+    const clusterIndexStr = clusterIndex.toString();
+
+    return this.triggerAction<{
+      action_id: string;
+    }>({
+      type: "sequence_of_actions",
+      parameters: {
+        bdbId: resolvedBdbId,
+        actions: [
+          {
+            type: "migrate",
+            params: {
+              cluster_index: clusterIndexStr,
+              bdb_id: resolvedBdbId,
+            },
+          },
+          {
+            type: "bind",
+            params: {
+              cluster_index: clusterIndexStr,
+              bdb_id: resolvedBdbId,
+            },
+          },
+        ],
+      },
+    });
+  }
+
+  #resolveBdbId(bdbId?: string | number): string | undefined {
+    if (bdbId !== undefined) {
+      if (this.dbConfig?.bdbId !== undefined) {
+        dbg(`User provided bdbId(${bdbId}), which will shadow selected bdbId(${this.dbConfig.bdbId})`);
+      }
+      return String(bdbId);
+    }
+
+    if (this.dbConfig?.bdbId !== undefined) {
+      return String(this.dbConfig.bdbId);
+    }
+
+  }
+
+  async #request<T>(
+    method: string,
+    path: string,
+    body?: object | string,
+    timeoutMs: number = 30000
+  ): Promise<T> {
+    const url = `${this.baseUrl}${path}`;
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+
+    let payload: string | undefined;
+
+    if (body) {
+      if (typeof body === "string") {
+        headers["Content-Type"] = "text/plain";
+        payload = body;
+      } else {
+        headers["Content-Type"] = "application/json";
+        payload = JSON.stringify(body);
+      }
+    }
+
+    // Add timeout to fetch using AbortController
+    const controller = new AbortController();
+    const timeoutId = globalThis.setTimeout(() => {
+      controller.abort();
+    }, timeoutMs);
+
+    try {
+      const response = await this.#fetch(url, {
+        method,
+        headers,
+        body: payload,
+        signal: controller.signal
+      });
+
+      if (!response.ok) {
+        const text = await response.text().catch(() => "");
+        throw new Error(text ? `HTTP ${response.status} - ${text}` : `HTTP ${response.status}`);
+      }
+
+      try {
+        const result = (await response.json()) as T;
+        return result;
+      } catch {
+        throw new Error(
+          `HTTP ${response.status} - Unable to parse response as JSON`
+        );
+      }
+    } finally {
+      globalThis.clearTimeout(timeoutId);
+    }
+  }
+
+  /**
+   * Deletes a database.
+   * @param clusterIndex The index of the cluster
+   * @param bdbId The database ID (optional if dbConfig is set)
+   * @throws {Error} When the HTTP request fails or response cannot be parsed as JSON
+   */
+  public async deleteDatabase(
+    bdbId?: number | string,
+    clusterIndex: number = 0
+  ) {
+    const resolvedBdbId = this.#resolveBdbId(bdbId);
+    dbg('deleteDatabase: bdb', resolvedBdbId, 'cluster', clusterIndex);
+    return this.triggerAction({
+      type: "delete_database",
+      parameters: {
+        cluster_index: clusterIndex,
+        bdb_id: resolvedBdbId,
+      },
+    });
+  }
+
+  /**
+   * Deletes all databases.
+   * @param clusterIndex The index of the cluster
+   * @throws {Error} When the HTTP request fails or response cannot be parsed as JSON
+   */
+  public async deleteAllDatabases(clusterIndex: number = 0) {
+    dbg('deleteAllDatabases: cluster', clusterIndex);
+    return this.triggerAction({
+      type: "delete_database",
+      parameters: {
+        cluster_index: clusterIndex,
+        delete_all: true,
+      },
+    });
+  }
+
+  /**
+   * Creates a new database.
+   * @param clusterIndex The index of the cluster
+   * @param databaseConfig The database configuration
+   * @throws {Error} When the HTTP request fails or response cannot be parsed as JSON
+   */
+  public async createAndSelectDatabase(
+    databaseConfig: CreateDatabaseConfig,
+    clusterIndex: number = 0
+  ) {
+    dbg('createDatabase: cluster', clusterIndex);
+    const action = await this.triggerAction({
+      type: "create_database",
+      parameters: {
+        cluster_index: clusterIndex,
+        database_config: databaseConfig,
+      },
+    });
+
+    const dbConfig =
+      typeof action.output === "object"
+        ? action.output
+        : JSON.parse(action.output);
+
+    const rawEndpoints = dbConfig.raw_endpoints[0];
+
+    if (!rawEndpoints) {
+      dbg('No endpoints found');
+      throw new Error("No endpoints found in database config");
+    }
+
+    const result = {
+      host: rawEndpoints.dns_name,
+      port: rawEndpoints.port,
+      password: dbConfig.password,
+      username: dbConfig.username,
+      tls: dbConfig.tls,
+      bdbId: dbConfig.bdb_id,
+    };
+    dbg('created:', result.host + ':' + result.port, 'bdb', result.bdbId);
+    this.selectDbConfig(result);
+
+    return result;
+  }
+
+  /**
+   * Lists the multi-db failover triggers, one requirement per member topology.
+   * @throws {Error} When the HTTP request fails or response cannot be parsed as JSON
+   */
+  public async listMultiDbFailoverTriggers(): Promise<MultiDbFailoverTrigger[]> {
+    const res = await this.#request<{ triggers: MultiDbFailoverTrigger[] }>(
+      "GET",
+      "/multi-db-failover"
+    );
+    return res.triggers;
+  }
+
+  /**
+   * Provisions a multi-db member fleet (one member per cluster) for a topology.
+   * Blocks until every member is active.
+   * @param topology The member topology to provision
+   * @param trigger The trigger the fleet must support
+   * @throws {Error} When the topology is not offered or the setup fails
+   */
+  public async multiDbSetup(
+    topology: MultiDbTopology,
+    trigger = "network_failure"
+  ): Promise<MultiDbSetup> {
+    const triggers = await this.listMultiDbFailoverTriggers();
+    const requirements = triggers.find(t => t.name === trigger)?.requirements ?? [];
+    const variantIndex = requirements.findIndex(r => r.config === topology);
+    if (variantIndex === -1) {
+      throw new Error(`Fault injector offers no "${topology}" topology for trigger "${trigger}"`);
+    }
+
+    dbg('multiDbSetup:', topology, 'variant', variantIndex);
+    const setup = await this.#request<MultiDbSetup>(
+      "POST",
+      `/multi-db-failover/setup?${new URLSearchParams({
+        trigger,
+        variant_index: String(variantIndex)
+      })}`,
+      undefined,
+      MULTI_DB_BLOCKING_TIMEOUT_MS
+    );
+    dbg('multiDbSetup done:', setup.setup_id, setup.instances.map(i => ({
+      cluster_index: i.cluster_index,
+      bdb_id: i.bdb_id,
+      endpoints: i.endpoints
+    })));
+    return setup;
+  }
+
+  /**
+   * Takes one member of a multi-db setup offline and keeps it down until
+   * {@link multiDbRestore}. Resolves once the outage is in place.
+   * @param setupId The setup id from {@link multiDbSetup}
+   * @param instanceIndex Which member to take offline
+   * @throws {Error} When the action fails
+   */
+  public async multiDbTakeOffline(
+    setupId: string,
+    instanceIndex: number,
+    options?: TriggerActionOptions
+  ): Promise<ActionStatus> {
+    dbg('multiDbTakeOffline:', setupId, 'instance', instanceIndex);
+    const { action_id } = await this.#request<{ action_id: string }>(
+      "POST",
+      `/multi-db-failover?${new URLSearchParams({
+        trigger: "network_failure",
+        setup_id: setupId,
+        instance_index: String(instanceIndex),
+        hold: "true"
+      })}`
+    );
+    dbg('action_id:', action_id);
+    return this.waitForAction(action_id, options);
+  }
+
+  /**
+   * Brings a member taken offline by {@link multiDbTakeOffline} back online.
+   * Blocks until the network is restored.
+   * @param setupId The setup id from {@link multiDbSetup}
+   * @param instanceIndex Which member to restore
+   * @throws {Error} When the HTTP request fails
+   */
+  public async multiDbRestore(setupId: string, instanceIndex: number): Promise<unknown> {
+    dbg('multiDbRestore:', setupId, 'instance', instanceIndex);
+    return this.#request(
+      "POST",
+      `/multi-db-failover/restore?${new URLSearchParams({
+        setup_id: setupId,
+        instance_index: String(instanceIndex)
+      })}`,
+      undefined,
+      MULTI_DB_BLOCKING_TIMEOUT_MS
+    );
+  }
+
+  /**
+   * Deletes every member of a multi-db setup and flushes any network block
+   * left behind. Blocks until done.
+   * @param setupId The setup id from {@link multiDbSetup}
+   * @throws {Error} When the HTTP request fails
+   */
+  public async multiDbTeardown(setupId: string): Promise<unknown> {
+    dbg('multiDbTeardown:', setupId);
+    const res = await this.#request(
+      "POST",
+      `/multi-db-failover/teardown?${new URLSearchParams({
+        setup_id: setupId,
+        clean_iptables: "true"
+      })}`,
+      undefined,
+      MULTI_DB_BLOCKING_TIMEOUT_MS
+    );
+    dbg('multiDbTeardown done:', res);
+    return res;
+  }
+
+}
+
+// The blocking multi-db routes create or delete databases; a CRDB can take many minutes.
+const MULTI_DB_BLOCKING_TIMEOUT_MS = 20 * 60 * 1000;

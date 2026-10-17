@@ -1,0 +1,768 @@
+import assert from 'node:assert';
+import RedisCommandsQueue from './commands-queue';
+import { AbortError, DisconnectsClientError, TimeoutError } from '../errors';
+import { PUBSUB_TYPE } from './pub-sub';
+
+describe('RedisCommandsQueue', () => {
+  function createQueue() {
+    return new RedisCommandsQueue(3, null, () => {}, 'test-client');
+  }
+
+  function wait(ms: number) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  describe('hasCapacity', () => {
+    it('always has capacity when no max length is configured', () => {
+      const queue = createQueue();
+      queue.addCommand(['PING']);
+      assert.equal(queue.hasCapacity(1_000_000), true);
+    });
+
+    it('counts queued commands against the max length', () => {
+      const queue = new RedisCommandsQueue(3, 3, () => {}, 'test-client');
+      queue.addCommand(['PING']);
+      assert.equal(queue.hasCapacity(2), true);
+      assert.equal(queue.hasCapacity(3), false);
+    });
+  });
+
+  describe('extractAllCommands', () => {
+    it('returns and removes every queued command, not just the first one', () => {
+      const queue = createQueue();
+      for (let i = 0; i < 5; i++) {
+        queue.addCommand([`CMD${i}`]).catch(() => {});
+      }
+
+      const extracted = queue.extractAllCommands();
+
+      assert.strictEqual(extracted.length, 5);
+      assert.deepStrictEqual(
+        extracted.map(command => command.args?.[0]),
+        ['CMD0', 'CMD1', 'CMD2', 'CMD3', 'CMD4'],
+      );
+      assert.strictEqual(queue.extractAllCommands().length, 0);
+    });
+  });
+
+  describe('chainInExecution', () => {
+    it('is undefined before anything is written, and matches a chain once part of it is sent', () => {
+      const queue = createQueue();
+      const chainId = Symbol('MULTI Chain');
+
+      assert.strictEqual(queue.chainInExecution, undefined);
+
+      queue.addCommand(['MULTI'], { chainId }).catch(() => {});
+      queue.addCommand(['SET', 'k', 'v'], { chainId }).catch(() => {});
+      queue.addCommand(['EXEC'], { chainId }).catch(() => {});
+
+      // Nothing sent yet - the whole chain is still just sitting in #toWrite.
+      assert.strictEqual(queue.chainInExecution, undefined);
+
+      const writer = queue.commandsToWrite();
+      writer.next(); // "sends" MULTI
+      writer.next(); // "sends" SET
+
+      // Two of the three commands are now in #waitingForReply (out of view);
+      // chainInExecution should point at this chain, and the one command
+      // still in #toWrite (EXEC) should carry a matching chainId - that's
+      // the tail-of-an-in-flight-chain signal cluster-slots.ts relies on.
+      assert.strictEqual(queue.chainInExecution, chainId);
+
+      const remaining = queue.extractAllCommands();
+      assert.strictEqual(remaining.length, 1);
+      assert.strictEqual(remaining[0].chainId, queue.chainInExecution);
+    });
+
+    it('leaves a finished chain with no queued tail to relocate', () => {
+      const queue = createQueue();
+      const chainId = Symbol('MULTI Chain');
+
+      queue.addCommand(['MULTI'], { chainId }).catch(() => {});
+      queue.addCommand(['EXEC'], { chainId }).catch(() => {});
+
+      const writer = queue.commandsToWrite();
+      writer.next(); // "sends" MULTI
+      writer.next(); // "sends" EXEC - whole chain is now in #waitingForReply
+
+      // The whole chain was sent, so nothing of it remains in #toWrite -
+      // extractAllCommands has nothing left to (mis)classify as its tail.
+      assert.strictEqual(queue.chainInExecution, chainId);
+      assert.strictEqual(queue.extractAllCommands().length, 0);
+    });
+  });
+
+  describe('extractCommandsForSlots', () => {
+    it('leaves the queued tail of an in-flight chain and everything after it in place', () => {
+      const queue = createQueue();
+      const chainId = Symbol('MULTI Chain');
+
+      queue.addCommand(['MULTI'], { chainId, slotNumber: 1 }).catch(() => {});
+      queue.addCommand(['SET', 'k', 'v'], { chainId, slotNumber: 1 }).catch(() => {});
+      queue.addCommand(['EXEC'], { chainId, slotNumber: 1 }).catch(() => {});
+      // Queued after the chain, on the same connection. If this were
+      // relocated to another node while the transaction is still pending
+      // here, it could run before the transaction completes - reading 'k'
+      // before SET applies, even though it was queued after EXEC.
+      queue.addCommand(['GET', 'k'], { slotNumber: 1 }).catch(() => {});
+
+      const writer = queue.commandsToWrite();
+      writer.next(); // "sends" MULTI - SET, EXEC and GET are still queued behind it
+
+      const extracted = queue.extractCommandsForSlots(new Set([1]));
+
+      // Nothing is extracted: reaching the in-flight chain's tail stops the
+      // scan entirely, so GET stays behind it in queue order too.
+      assert.deepStrictEqual(extracted, []);
+      assert.strictEqual(queue.pendingCount, 4);
+    });
+
+    it('is unaffected by an already-fully-sent chain', () => {
+      const queue = createQueue();
+      const chainId = Symbol('MULTI Chain');
+
+      queue.addCommand(['MULTI'], { chainId, slotNumber: 1 }).catch(() => {});
+      queue.addCommand(['EXEC'], { chainId, slotNumber: 1 }).catch(() => {});
+      queue.addCommand(['GET', 'k'], { slotNumber: 1 }).catch(() => {});
+
+      const writer = queue.commandsToWrite();
+      writer.next(); // "sends" MULTI
+      writer.next(); // "sends" EXEC - the whole chain is now in #waitingForReply
+
+      const extracted = queue.extractCommandsForSlots(new Set([1]));
+
+      // chainInExecution still points at this chain (nothing has been sent
+      // since), but none of its commands remain in #toWrite to (mis)match -
+      // the trailing GET is extracted normally.
+      assert.strictEqual(queue.chainInExecution, chainId);
+      assert.deepStrictEqual(
+        extracted.map(command => command.args?.[0]),
+        ['GET'],
+      );
+    });
+
+    it('extracts a second, fully-queued chain atomically without mistaking it for the in-flight chain\'s tail', () => {
+      const queue = createQueue();
+      const chainA = Symbol('Chain A (in-flight, different slot)');
+      const chainB = Symbol('Chain B (fully queued, migrating slot)');
+
+      // Chain A is in flight on a slot that isn't migrating - its queued
+      // tail (SET, EXEC) carries a chainId that will equal chainInExecution.
+      queue.addCommand(['MULTI'], { chainId: chainA, slotNumber: 5 }).catch(() => {});
+      queue.addCommand(['SET', 'a', '1'], { chainId: chainA, slotNumber: 5 }).catch(() => {});
+      queue.addCommand(['EXEC'], { chainId: chainA, slotNumber: 5 }).catch(() => {});
+
+      // Chain B is queued entirely behind chain A, on the slot that IS
+      // migrating. None of its commands have been sent, so none of them
+      // carry chainInExecution's id - it's a distinct chain, not a
+      // continuation of chain A's tail.
+      queue.addCommand(['MULTI'], { chainId: chainB, slotNumber: 1 }).catch(() => {});
+      queue.addCommand(['SET', 'b', '2'], { chainId: chainB, slotNumber: 1 }).catch(() => {});
+      queue.addCommand(['EXEC'], { chainId: chainB, slotNumber: 1 }).catch(() => {});
+
+      const writer = queue.commandsToWrite();
+      writer.next(); // "sends" chain A's MULTI - chainInExecution now points at chain A
+
+      const extracted = queue.extractCommandsForSlots(new Set([1]));
+
+      // Chain A's tail lives on slot 5, so it's skipped over (not in the
+      // migrating slot set) without ever triggering the in-flight-tail
+      // guard. Chain B, entirely on slot 1, is then extracted as a whole -
+      // its distinct chainId never matches chainInExecution, so it's never
+      // mistaken for chain A's tail and relocates atomically, in order.
+      assert.deepStrictEqual(
+        extracted.map(command => command.args?.[0]),
+        ['MULTI', 'SET', 'EXEC'],
+      );
+      assert.ok(extracted.every(command => command.chainId === chainB));
+
+      // Chain A's tail stays behind, untouched, on its own slot.
+      const remaining = queue.extractAllCommands();
+      assert.deepStrictEqual(
+        remaining.map(command => command.args?.[0]),
+        ['SET', 'EXEC'],
+      );
+    });
+  });
+
+  describe('asap inside a partly written chain', () => {
+    function queuedCommandNames(queue: RedisCommandsQueue) {
+      return queue.extractAllCommands().map(command => String(command.args?.[0]));
+    }
+
+    function addChainAndWriteHead(queue: RedisCommandsQueue, written: number) {
+      const chainId = Symbol('MULTI Chain');
+      for (const name of ['MULTI', 'SET', 'SET2', 'EXEC']) {
+        queue.addCommand([name], { chainId }).catch(() => {});
+      }
+
+      const writer = queue.commandsToWrite();
+      for (let i = 0; i < written; i++) {
+        writer.next();
+      }
+      return chainId;
+    }
+
+    it('queues an asap command after the unwritten tail of the chain', () => {
+      const queue = createQueue();
+      addChainAndWriteHead(queue, 2);
+
+      queue.addCommand(['PING'], { asap: true }).catch(() => {});
+
+      assert.deepStrictEqual(queuedCommandNames(queue), ['SET2', 'EXEC', 'PING']);
+    });
+
+    it('keeps the reverse order for repeated asap commands', () => {
+      const queue = createQueue();
+      addChainAndWriteHead(queue, 1);
+
+      queue.addCommand(['PING1'], { asap: true }).catch(() => {});
+      queue.addCommand(['PING2'], { asap: true }).catch(() => {});
+
+      assert.deepStrictEqual(
+        queuedCommandNames(queue),
+        ['SET', 'SET2', 'EXEC', 'PING2', 'PING1']
+      );
+    });
+
+    it('does not leave the chain tail waiting for a reply behind an asap command', () => {
+      const queue = createQueue();
+      addChainAndWriteHead(queue, 2);
+      queue.addCommand(['PING'], { asap: true }).catch(() => {});
+
+      const written = [...queue.commandsToWrite()].map(encoded => encoded.join(''));
+
+      assert.ok(written[0].includes('SET2'));
+      assert.ok(written[1].includes('EXEC'));
+      assert.ok(written[2].includes('PING'));
+    });
+
+    it('still queues asap at the head when the chain is fully written', () => {
+      const queue = createQueue();
+      addChainAndWriteHead(queue, 4);
+      queue.addCommand(['LATER']).catch(() => {});
+
+      queue.addCommand(['PING'], { asap: true }).catch(() => {});
+
+      assert.deepStrictEqual(queuedCommandNames(queue), ['PING', 'LATER']);
+    });
+
+    it('still queues asap at the head when the head is not part of the chain', () => {
+      const queue = createQueue();
+      addChainAndWriteHead(queue, 4);
+      queue.addCommand(['LATER']).catch(() => {});
+      queue.addCommand(['PING1'], { asap: true }).catch(() => {});
+      queue.addCommand(['PING2'], { asap: true }).catch(() => {});
+
+      assert.deepStrictEqual(queuedCommandNames(queue), ['PING2', 'PING1', 'LATER']);
+    });
+
+    it('applies to asap MONITOR', () => {
+      const queue = createQueue();
+      addChainAndWriteHead(queue, 2);
+
+      queue.monitor(() => {}, { asap: true }).catch(() => {});
+
+      assert.deepStrictEqual(queuedCommandNames(queue), ['SET2', 'EXEC', 'MONITOR']);
+    });
+
+    it('applies to asap pub/sub commands', () => {
+      const queue = createQueue();
+      queue.extendPubSubListeners(
+        PUBSUB_TYPE.CHANNELS,
+        new Map([['channel', { unsubscribing: false, buffers: new Set(), strings: new Set([() => {}]) }]])
+      )?.catch(() => {});
+      Array.from(queue.commandsToWrite());
+      addChainAndWriteHead(queue, 2);
+
+      queue.resubscribe()?.catch(() => {});
+
+      assert.deepStrictEqual(queuedCommandNames(queue), ['SET2', 'EXEC', 'subscribe']);
+    });
+
+    it('applies to commands prepended from another queue, keeping their order', () => {
+      const queue = createQueue();
+      addChainAndWriteHead(queue, 2);
+      const source = createQueue();
+      source.addCommand(['A']).catch(() => {});
+      source.addCommand(['B']).catch(() => {});
+
+      queue.prependCommandsToWrite(source.extractAllCommands());
+
+      assert.deepStrictEqual(queuedCommandNames(queue), ['SET2', 'EXEC', 'A', 'B']);
+    });
+  });
+
+  describe('addCommand', () => {
+    it('does not keep a command if timeout listener setup fails', async () => {
+      const queue = createQueue();
+
+      const promise = queue.addCommand(['CMD'], { timeout: -1 });
+
+      await assert.rejects(promise, RangeError);
+      assert.strictEqual(queue.extractAllCommands().length, 0);
+    });
+  });
+
+  describe('rejectCommands', () => {
+    // Mirrors cluster-slots.ts's full-node-loss path: extractAllCommands()
+    // drains everything, then rejects it when no destination client exists.
+    it('rejects a command extracted via extractAllCommands when there is no destination', async () => {
+      const source = createQueue();
+      const promise = source.addCommand(['CMD'], { timeout: 1000 });
+      promise.catch(() => {});
+
+      const [command] = source.extractAllCommands();
+      source.rejectCommands([command], new DisconnectsClientError());
+
+      await assert.rejects(promise, DisconnectsClientError);
+      assert.strictEqual(source.extractAllCommands().length, 0);
+    });
+
+    // Mirrors cluster-slots.ts's partial-slot-migration path:
+    // extractCommandsForSlots() pulls out only the moving slots, then rejects
+    // them when no destination client exists, leaving the rest queued.
+    it('rejects a command extracted via extractCommandsForSlots when there is no destination', async () => {
+      const source = createQueue();
+      const promise = source.addCommand(['CMD'], { slotNumber: 1, timeout: 1000 });
+      promise.catch(() => {});
+      source.addCommand(['KEEP'], { slotNumber: 2 });
+
+      const [command] = source.extractCommandsForSlots(new Set([1]));
+      source.rejectCommands([command], new DisconnectsClientError());
+
+      await assert.rejects(promise, DisconnectsClientError);
+      assert.strictEqual(source.extractAllCommands().length, 1);
+    });
+  });
+
+  describe('full node loss (in-flight chain)', () => {
+    // Mirrors cluster-slots.ts's full-node-loss path: extractAllCommands()
+    // pulls the in-flight chain's queued tail out of #toWrite and rejects it
+    // explicitly, then the source client is destroyed, which calls
+    // flushAll() and rejects whatever's left in #waitingForReply - the
+    // chain's already-sent head. Both halves need to reject; otherwise the
+    // transaction half-commits: the server already applied the head against
+    // a connection this client is abandoning, while the tail is rejected as
+    // never sent.
+    it('rejects the already-sent head of an in-flight chain along with its queued tail', async () => {
+      const queue = createQueue();
+      const chainId = Symbol('MULTI Chain');
+
+      const multiPromise = queue.addCommand(['MULTI'], { chainId });
+      const setPromise = queue.addCommand(['SET', 'k', 'v'], { chainId });
+      const execPromise = queue.addCommand(['EXEC'], { chainId });
+      [multiPromise, setPromise, execPromise].forEach(promise => promise.catch(() => {}));
+
+      const writer = queue.commandsToWrite();
+      writer.next(); // "sends" MULTI - now in #waitingForReply
+      writer.next(); // "sends" SET - now in #waitingForReply
+
+      // EXEC is still the queued tail in #toWrite.
+      const remaining = queue.extractAllCommands();
+      assert.strictEqual(remaining.length, 1);
+      assert.strictEqual(remaining[0].chainId, queue.chainInExecution);
+
+      // cluster-slots.ts rejects the queued tail explicitly, since it can't
+      // be safely relocated to another node...
+      queue.rejectCommands(remaining, new DisconnectsClientError());
+
+      // ...then destroy()'s call to flushAll() rejects whatever's left in
+      // #waitingForReply - the already-sent MULTI and SET.
+      queue.flushAll(new DisconnectsClientError());
+
+      await Promise.all([
+        assert.rejects(multiPromise, DisconnectsClientError),
+        assert.rejects(setPromise, DisconnectsClientError),
+        assert.rejects(execPromise, DisconnectsClientError),
+      ]);
+    });
+  });
+
+  describe('prependCommandsToWrite', () => {
+
+    it('rebinds an abort listener so it removes the command from its new queue', async () => {
+      const source = createQueue();
+      const destination = createQueue();
+      const controller = new AbortController();
+
+      const promise = source.addCommand(['CMD'], { abortSignal: controller.signal });
+      promise.catch(() => {});
+
+      const [command] = source.extractAllCommands();
+      destination.prependCommandsToWrite([command]);
+
+      controller.abort();
+      await assert.rejects(promise, AbortError);
+
+      assert.strictEqual(destination.extractAllCommands().length, 0);
+    });
+
+    it('does not keep a command if its abort signal fired before prepend', async () => {
+      const source = createQueue();
+      const destination = createQueue();
+      const controller = new AbortController();
+
+      const promise = source.addCommand(['CMD'], {
+        abortSignal: controller.signal,
+        slotNumber: 1,
+      });
+      promise.catch(() => {});
+      source.addCommand(['KEEP'], { slotNumber: 2 });
+
+      const [command] = source.extractCommandsForSlots(new Set([1]));
+      controller.abort();
+      destination.prependCommandsToWrite([command]);
+
+      await assert.rejects(promise, AbortError);
+      assert.strictEqual(source.extractAllCommands().length, 1);
+      assert.strictEqual(destination.extractAllCommands().length, 0);
+    });
+
+    it('rebinds a timeout listener so it removes the command from its new queue', async () => {
+      const source = createQueue();
+      const destination = createQueue();
+
+      const promise = source.addCommand(['CMD'], { timeout: 10 });
+      promise.catch(() => {});
+
+      const [command] = source.extractAllCommands();
+      destination.prependCommandsToWrite([command]);
+
+      await assert.rejects(promise, TimeoutError);
+      assert.strictEqual(destination.extractAllCommands().length, 0);
+    });
+
+    it('does not keep a command if its timeout fired before prepend', async () => {
+      const source = createQueue();
+      const destination = createQueue();
+
+      const promise = source.addCommand(['CMD'], {
+        slotNumber: 1,
+        timeout: 1,
+      });
+      promise.catch(() => {});
+      source.addCommand(['KEEP'], { slotNumber: 2 });
+
+      const [command] = source.extractCommandsForSlots(new Set([1]));
+      await wait(5);
+      // Confirm the timeout actually already fired, so prependCommandsToWrite
+      // is exercising the "reject immediately" branch below and not just
+      // rebinding a listener that happens to fire before the final assert.
+      assert.strictEqual(command.timeout?.signal.aborted, true);
+      destination.prependCommandsToWrite([command]);
+
+      await assert.rejects(promise, TimeoutError);
+      assert.strictEqual(source.extractAllCommands().length, 1);
+      assert.strictEqual(destination.extractAllCommands().length, 0);
+    });
+
+    it('removes the timeout listener when abort wins after prepend', async () => {
+      const source = createQueue();
+      const destination = createQueue();
+      const controller = new AbortController();
+
+      const promise = source.addCommand(['CMD'], {
+        abortSignal: controller.signal,
+        timeout: 5,
+      });
+      promise.catch(() => {});
+      destination.addCommand(['KEEP']);
+
+      const [command] = source.extractAllCommands();
+      destination.prependCommandsToWrite([command]);
+
+      controller.abort();
+      await assert.rejects(promise, AbortError);
+      await wait(10);
+
+      assert.strictEqual(destination.extractAllCommands().length, 1);
+    });
+
+    it('removes the abort listener when timeout already fired before prepend', async () => {
+      const source = createQueue();
+      const destination = createQueue();
+      const controller = new AbortController();
+
+      const promise = source.addCommand(['CMD'], {
+        abortSignal: controller.signal,
+        slotNumber: 1,
+        timeout: 1,
+      });
+      promise.catch(() => {});
+      source.addCommand(['KEEP'], { slotNumber: 2 });
+
+      const [command] = source.extractCommandsForSlots(new Set([1]));
+      await wait(5);
+      // Confirm the timeout actually already fired before prepend, so the
+      // abort listener removed below is the one attached at addCommand time,
+      // not a listener that would have been rebound had we hit that branch.
+      assert.strictEqual(command.timeout?.signal.aborted, true);
+
+      destination.prependCommandsToWrite([command]);
+      await assert.rejects(promise, TimeoutError);
+
+      controller.abort();
+
+      assert.strictEqual(source.extractAllCommands().length, 1);
+      assert.strictEqual(destination.extractAllCommands().length, 0);
+    });
+
+    it('rebinds listeners for every command when extractAllCommands returns multiple commands', async () => {
+      const source = createQueue();
+      const destination = createQueue();
+      const controllers = [
+        new AbortController(),
+        new AbortController(),
+        new AbortController(),
+      ];
+      const settled = [false, false, false];
+
+      const promises = controllers.map((controller, i) => {
+        const promise = source.addCommand([`CMD${i}`], { abortSignal: controller.signal });
+        promise.catch(() => {}).finally(() => { settled[i] = true; });
+        return promise;
+      });
+
+      const commands = source.extractAllCommands();
+      assert.strictEqual(commands.length, 3);
+      assert.deepStrictEqual(
+        commands.map(command => command.args?.[0]),
+        ['CMD0', 'CMD1', 'CMD2'],
+      );
+
+      destination.prependCommandsToWrite(commands);
+      assert.strictEqual(destination.pendingCount, 3);
+      assert.strictEqual(source.pendingCount, 0);
+
+      // Abort out of order (middle, then last, then first) to confirm each
+      // command's listener was independently rebound to its own node in the
+      // destination queue, and that cancelling one doesn't settle or corrupt
+      // the others still queued.
+      controllers[1].abort();
+      await assert.rejects(promises[1], AbortError);
+      assert.deepStrictEqual(settled, [false, true, false]);
+      assert.strictEqual(destination.pendingCount, 2);
+
+      controllers[2].abort();
+      await assert.rejects(promises[2], AbortError);
+      assert.deepStrictEqual(settled, [false, true, true]);
+      assert.strictEqual(destination.pendingCount, 1);
+
+      controllers[0].abort();
+      await assert.rejects(promises[0], AbortError);
+      assert.deepStrictEqual(settled, [true, true, true]);
+
+      // Check the destination queue by actually traversing it (not just its
+      // length counter), to confirm the linked list itself wasn't corrupted
+      // by the three removals above.
+      assert.strictEqual(destination.extractAllCommands().length, 0);
+
+      // None of the cancellations should have reached back into the
+      // already-drained source queue.
+      assert.strictEqual(source.extractAllCommands().length, 0);
+    });
+  });
+
+  describe('prelude', () => {
+    function prelude() {
+      const outcomes: Array<unknown> = [];
+      return {
+        outcomes,
+        prelude: {
+          args: ['CLIENT', 'CACHING', 'NO'],
+          onReply: (err?: unknown) => { outcomes.push(err ?? 'ok'); }
+        }
+      };
+    }
+
+    function written(queue: RedisCommandsQueue) {
+      return [...queue.commandsToWrite()].map(chunks => chunks.join('')).join('');
+    }
+
+    it('writes the prelude and its command as one chunk, prelude first', () => {
+      const queue = createQueue();
+      const { prelude: p } = prelude();
+      queue.addCommand(['GET', 'k'], { prelude: p }).catch(() => {});
+
+      const chunks = [...queue.commandsToWrite()];
+      assert.strictEqual(chunks.length, 1);
+      assert.strictEqual(
+        chunks[0].join(''),
+        '*3\r\n$6\r\nCLIENT\r\n$7\r\nCACHING\r\n$2\r\nNO\r\n*2\r\n$3\r\nGET\r\n$1\r\nk\r\n'
+      );
+    });
+
+    it('reports the prelude reply and resolves the command with its own reply', async () => {
+      const queue = createQueue();
+      const { prelude: p, outcomes } = prelude();
+      const promise = queue.addCommand(['GET', 'k'], { prelude: p });
+      written(queue);
+
+      queue.decoder.write(Buffer.from('+OK\r\n$1\r\nv\r\n'));
+
+      assert.strictEqual(await promise, 'v');
+      assert.deepStrictEqual(outcomes, ['ok']);
+    });
+
+    it('reports a prelude error reply without rejecting the command', async () => {
+      const queue = createQueue();
+      const { prelude: p, outcomes } = prelude();
+      const promise = queue.addCommand(['GET', 'k'], { prelude: p });
+      written(queue);
+
+      queue.decoder.write(Buffer.from('-ERR denied\r\n$1\r\nv\r\n'));
+
+      assert.strictEqual(await promise, 'v');
+      assert.strictEqual(outcomes.length, 1);
+      assert.match(String(outcomes[0]), /denied/);
+    });
+
+    it('is rejected as a whole when the queue has room for only one of the two', async () => {
+      const queue = new RedisCommandsQueue(3, 2, () => {}, 'test-client');
+      queue.addCommand(['PING']).catch(() => {});
+      const { prelude: p, outcomes } = prelude();
+
+      await assert.rejects(queue.addCommand(['GET', 'k'], { prelude: p }), /The queue is full/);
+
+      assert.strictEqual(written(queue), '*1\r\n$4\r\nPING\r\n', 'the prelude must not be written');
+      assert.deepStrictEqual(outcomes, []);
+    });
+
+    it('writes neither when the command fails to encode', async () => {
+      const queue = createQueue();
+      const { prelude: p } = prelude();
+      const promise = queue.addCommand([1 as never], { prelude: p });
+
+      assert.strictEqual(written(queue), '');
+      await assert.rejects(promise, TypeError);
+    });
+
+    it('is removed as a whole when aborted before it is written', async () => {
+      const queue = createQueue();
+      const controller = new AbortController();
+      const { prelude: p } = prelude();
+      const promise = queue.addCommand(['GET', 'k'], { prelude: p, abortSignal: controller.signal });
+
+      controller.abort();
+
+      await assert.rejects(promise, AbortError);
+      assert.strictEqual(written(queue), '');
+    });
+
+    it('is removed as a whole when it times out before it is written', async () => {
+      const queue = createQueue();
+      const { prelude: p } = prelude();
+      const promise = queue.addCommand(['GET', 'k'], { prelude: p, timeout: 1 });
+
+      await assert.rejects(promise, TimeoutError);
+      assert.strictEqual(written(queue), '');
+    });
+
+    it('fails both when the connection is lost after the write', async () => {
+      const queue = createQueue();
+      const { prelude: p, outcomes } = prelude();
+      const promise = queue.addCommand(['GET', 'k'], { prelude: p });
+      written(queue);
+
+      queue.flushAll(new DisconnectsClientError());
+
+      await assert.rejects(promise, DisconnectsClientError);
+      assert.strictEqual(outcomes.length, 1);
+      assert.ok(outcomes[0] instanceof DisconnectsClientError);
+    });
+
+    it('travels with its command when extracted and prepended to another queue', () => {
+      const source = createQueue();
+      const destination = createQueue();
+      const { prelude: p } = prelude();
+      source.addCommand(['GET', 'k'], { prelude: p }).catch(() => {});
+
+      destination.prependCommandsToWrite(source.extractAllCommands());
+
+      assert.strictEqual(written(source), '');
+      assert.match(written(destination), /^\*3\r\n\$6\r\nCLIENT.*GET/s);
+    });
+  });
+
+  describe('RESP2 pub/sub decoder reset', () => {
+    function createResp2Queue() {
+      return new RedisCommandsQueue(2, null, () => {}, 'test-client');
+    }
+
+    function drain(queue: RedisCommandsQueue) {
+      for (const _ of queue.commandsToWrite());
+    }
+
+    function reply(...items: Array<string | number>) {
+      return Buffer.from(
+        `*${items.length}\r\n` +
+        items.map(item => typeof item === 'number' ? `:${item}\r\n` : `$${item.length}\r\n${item}\r\n`).join('')
+      );
+    }
+
+    async function get(queue: RedisCommandsQueue) {
+      const promise = queue.addCommand(['GET', 'k']);
+      drain(queue);
+      queue.decoder.write(Buffer.from('$1\r\nv\r\n'));
+      return promise;
+    }
+
+    it('leaves pub/sub mode after the last channel is unsubscribed', async () => {
+      const queue = createResp2Queue();
+      const subscribed = queue.subscribe(PUBSUB_TYPE.CHANNELS, 'a', () => {});
+      drain(queue);
+      queue.decoder.write(reply('subscribe', 'a', 1));
+      await subscribed;
+
+      const unsubscribed = queue.unsubscribe(PUBSUB_TYPE.CHANNELS, 'a');
+      drain(queue);
+      queue.decoder.write(reply('unsubscribe', 'a', 0));
+      await unsubscribed;
+
+      assert.strictEqual(await get(queue), 'v');
+    });
+
+    it('leaves pub/sub mode when adopted listeners are moved away before their SUBSCRIBE replies', async () => {
+      const source = createResp2Queue();
+      source.subscribe(PUBSUB_TYPE.CHANNELS, 'a', () => {})?.catch(() => {});
+      const queue = createResp2Queue();
+      const adopted = queue.extendPubSubListeners(
+        PUBSUB_TYPE.CHANNELS,
+        source.removeAllPubSubListeners()[PUBSUB_TYPE.CHANNELS]
+      );
+      drain(queue);
+
+      queue.removeAllPubSubListeners();
+      const unsubscribed = queue.unsubscribe(PUBSUB_TYPE.CHANNELS);
+      drain(queue);
+      queue.decoder.write(reply('subscribe', 'a', 1));
+      queue.decoder.write(reply('unsubscribe', 'a', 0));
+      await Promise.all([adopted, unsubscribed]);
+
+      assert.strictEqual(await get(queue), 'v');
+    });
+
+    for (const flush of ['flushWaitingForReply', 'flushAll'] as const) {
+      it(`leaves pub/sub mode after ${flush} rejects an in-flight SUBSCRIBE`, async () => {
+        const queue = createResp2Queue();
+        const lost = queue.subscribe(PUBSUB_TYPE.CHANNELS, 'a', () => {});
+        drain(queue);
+        queue[flush](new DisconnectsClientError());
+        await assert.rejects(lost!, DisconnectsClientError);
+        assert.strictEqual(queue.isPubSubActive, false);
+
+        const subscribed = queue.subscribe(PUBSUB_TYPE.CHANNELS, 'b', () => {});
+        drain(queue);
+        queue.decoder.write(reply('subscribe', 'b', 1));
+        await subscribed;
+        const unsubscribed = queue.unsubscribe(PUBSUB_TYPE.CHANNELS, 'b');
+        drain(queue);
+        queue.decoder.write(reply('unsubscribe', 'b', 0));
+        await unsubscribed;
+
+        assert.strictEqual(await get(queue), 'v');
+      });
+    }
+  });
+});

@@ -1,0 +1,21 @@
+import { CommandParser } from '@redis/client/dist/lib/client/parser';
+import { RedisArgument, Command, NullReply, NumberReply, ArrayReply } from '@redis/client/dist/lib/RESP/types';
+import { transformRedisJsonArgument } from '@redis/client/dist/lib/commands/generic-transformers';
+
+export interface JsonStrAppendOptions {
+  path?: RedisArgument;
+}
+
+export default {
+  parseCommand(parser: CommandParser, key: RedisArgument, append: string, options?: JsonStrAppendOptions) {
+    parser.push('JSON.STRAPPEND');
+    parser.pushKey(key);
+
+    if (options?.path !== undefined) {
+      parser.push(options.path);
+    }
+
+    parser.push(transformRedisJsonArgument(append));
+  },
+  transformReply: undefined as unknown as () => NumberReply | ArrayReply<NullReply | NumberReply>
+} as const satisfies Command;

@@ -1,0 +1,18 @@
+import { CommandParser } from '@redis/client/dist/lib/client/parser';
+import { RedisArgument, Command, NumberReply, UnwrapReply } from '@redis/client/dist/lib/RESP/types';
+import AGGREGATE_WITHCURSOR from './AGGREGATE_WITHCURSOR';
+
+export interface FtCursorReadOptions {
+  COUNT?: number;
+}
+
+export default {
+  parseCommand(parser: CommandParser, index: RedisArgument, cursor: UnwrapReply<NumberReply>, options?: FtCursorReadOptions) {
+    parser.push('FT.CURSOR', 'READ', index, cursor.toString());
+
+    if (options?.COUNT !== undefined) {
+      parser.push('COUNT', options.COUNT.toString());
+    }
+  },
+  transformReply: AGGREGATE_WITHCURSOR.transformReply,
+} as const satisfies Command;

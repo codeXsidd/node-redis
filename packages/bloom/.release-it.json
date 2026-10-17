@@ -1,0 +1,23 @@
+{
+  "npm": {
+    "publish": true,
+    "skipChecks": true,
+    "publishArgs": ["--access", "public"]
+  },
+  "git": {
+    "tagName": "bloom@${version}",
+    "tagMatch": "bloom@*",
+    "commitMessage": "Release ${tagName}",
+    "tagAnnotation": "Release ${tagName}",
+    "commitArgs": "--all"
+  },
+  "plugins": {
+    "@release-it/bumper": {
+      "out": {
+        "file": "package.json",
+        "path": ["peerDependencies.@redis/client"],
+        "versionPrefix": "^"
+      }
+    }
+  }
+}

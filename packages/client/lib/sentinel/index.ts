@@ -1,0 +1,2097 @@
+import { EventEmitter } from 'node:events';
+import { CommandArguments, RedisArgument, RedisFunctions, RedisModules, RedisScripts, ReplyUnion, RespVersions, TypeMapping, DEFAULT_RESP } from '../RESP/types';
+import { ScanIteratorInterruptedError } from '../errors';
+import RedisClient, { AnyRedisClientOptions, RedisClientOptions, RedisClientType, ScanIteratorOptions } from '../client';
+import { CommandOptions } from '../client/commands-queue';
+import { attachConfig } from '../commander';
+import { NON_STICKY_COMMANDS } from '../commands';
+import { ClientErrorEvent, NamespaceProxySentinel, NamespaceProxySentinelClient, NodeAddressMap, ProxySentinel, ProxySentinelClient, RedisNode, RedisSentinelClientType, RedisSentinelEvent, RedisSentinelOptions, RedisSentinelType, SentinelCommander } from './types';
+import { clientSocketToNode, createCommand, createFunctionCommand, createModuleCommand, createNodeList, createScriptCommand, getMappedNode, mergeSentinelNodes, parseNode } from './utils';
+import { RedisMultiQueuedCommand } from '../multi-command';
+import RedisSentinelMultiCommand, { RedisSentinelMultiCommandType } from './multi-commands';
+import { PubSubListener } from '../client/pub-sub';
+import { PubSubProxy } from './pub-sub-proxy';
+import { setTimeout } from 'node:timers/promises';
+import RedisSentinelModule from './module'
+import { RedisVariadicArgument } from '../commands/generic-transformers';
+import { prefixKeys } from '../client/parser';
+import { WaitQueue } from './wait-queue';
+import { TcpNetConnectOpts } from 'node:net';
+import { RedisTcpSocketOptions } from '../client/socket';
+import { BasicPooledClientSideCache, PooledClientSideCacheProvider } from '../client/cache';
+import { ClientIdentity, ClientRole, generateClientId } from '../client/identity';
+import { FieldsetRegistry } from '../himport/registry';
+import { DEFAULT_COMMAND_TIMEOUT } from '../defaults';
+import { ScanOptions } from '../commands/SCAN';
+
+interface ClientInfo {
+  id: number;
+}
+
+export class RedisSentinelClient<
+  M extends RedisModules,
+  F extends RedisFunctions,
+  S extends RedisScripts,
+  RESP extends RespVersions,
+  TYPE_MAPPING extends TypeMapping
+> {
+  #clientInfo: ClientInfo | undefined;
+  #internal: RedisSentinelInternal<M, F, S, RESP, TYPE_MAPPING>;
+  readonly _self: RedisSentinelClient<M, F, S, RESP, TYPE_MAPPING>;
+
+  /**
+   * Indicates if the client connection is open
+   *
+   * @returns `true` if the client connection is open, `false` otherwise
+   */
+
+  get isOpen() {
+    return this._self.#internal.isOpen;
+  }
+
+  /**
+   * Indicates if the client connection is ready to accept commands
+   *
+   * @returns `true` if the client connection is ready, `false` otherwise
+   */
+  get isReady() {
+    return this._self.#internal.isReady;
+  }
+
+  /**
+   * Gets the command options configured for this client. Merges the constructor-set
+   * options with any per-proxy override from `withCommandOptions(...)`.
+   *
+   * @returns The effective command options or `undefined` if none were set
+   */
+  get commandOptions() {
+    return this._commandOptions !== undefined
+      ? { ...this._self.#commandOptions, ...this._commandOptions }
+      : this._self.#commandOptions;
+  }
+
+  /**
+   * The configured key prefix (see {@link RedisSentinelOptions.keyPrefix}), if any.
+   * @internal
+   */
+  get _keyPrefix(): RedisArgument | undefined {
+    return this._self.#internal.keyPrefix;
+  }
+
+  #commandOptions?: CommandOptions<TYPE_MAPPING>;
+  private _commandOptions?: CommandOptions<TYPE_MAPPING>;
+
+  constructor(
+    internal: RedisSentinelInternal<M, F, S, RESP, TYPE_MAPPING>,
+    clientInfo: ClientInfo,
+    commandOptions?: CommandOptions<TYPE_MAPPING>
+  ) {
+    this._self = this;
+    this.#internal = internal;
+    this.#clientInfo = clientInfo;
+    this.#commandOptions = commandOptions;
+  }
+
+  static factory<
+    M extends RedisModules = {},
+    F extends RedisFunctions = {},
+    S extends RedisScripts = {},
+    RESP extends RespVersions = 3,
+    TYPE_MAPPING extends TypeMapping = {}
+  >(config?: SentinelCommander<M, F, S, RESP, TYPE_MAPPING>) {
+    const SentinelClient = attachConfig({
+      BaseClass: RedisSentinelClient,
+      commands: NON_STICKY_COMMANDS,
+      createCommand: createCommand<ProxySentinelClient>,
+      createModuleCommand: createModuleCommand<NamespaceProxySentinelClient>,
+      createFunctionCommand: createFunctionCommand<NamespaceProxySentinelClient>,
+      createScriptCommand: createScriptCommand<ProxySentinelClient>,
+      config
+    });
+
+    SentinelClient.prototype.Multi = RedisSentinelMultiCommand.extend(config);
+
+    return (
+      internal: RedisSentinelInternal<M, F, S, RESP, TYPE_MAPPING>,
+      clientInfo: ClientInfo,
+      commandOptions?: CommandOptions<TYPE_MAPPING>
+    ) => {
+      // returning a "proxy" to prevent the namespaces._self to leak between "proxies"
+      return Object.create(new SentinelClient(internal, clientInfo, commandOptions)) as RedisSentinelClientType<M, F, S, RESP, TYPE_MAPPING>;
+    };
+  }
+
+  static create<
+    M extends RedisModules = {},
+    F extends RedisFunctions = {},
+    S extends RedisScripts = {},
+    RESP extends RespVersions = 3,
+    TYPE_MAPPING extends TypeMapping = {}
+  >(
+    options: RedisSentinelOptions<M, F, S, RESP, TYPE_MAPPING>,
+    internal: RedisSentinelInternal<M, F, S, RESP, TYPE_MAPPING>,
+    clientInfo: ClientInfo,
+    commandOptions?: CommandOptions<TYPE_MAPPING>,
+  ) {
+    return RedisSentinelClient.factory(options)(internal, clientInfo, commandOptions);
+  }
+
+  withCommandOptions<
+    OPTIONS extends CommandOptions<TYPE_MAPPING>,
+    TYPE_MAPPING extends TypeMapping
+  >(options: OPTIONS) {
+    const proxy = Object.create(this);
+    proxy._commandOptions = options;
+    return proxy as RedisSentinelClientType<
+      M,
+      F,
+      S,
+      RESP,
+      TYPE_MAPPING extends TypeMapping ? TYPE_MAPPING : {}
+    >;
+  }
+
+  private _commandOptionsProxy<
+    K extends keyof CommandOptions,
+    V extends CommandOptions[K]
+  >(
+    key: K,
+    value: V
+  ) {
+    const proxy = Object.create(this);
+    proxy._commandOptions = { ...this.commandOptions, [key]: value };
+    return proxy as RedisSentinelClientType<
+      M,
+      F,
+      S,
+      RESP,
+      K extends 'typeMapping' ? V extends TypeMapping ? V : {} : TYPE_MAPPING
+    >;
+  }
+
+  /**
+   * Override the `typeMapping` command option
+   */
+  withTypeMapping<TYPE_MAPPING extends TypeMapping>(typeMapping: TYPE_MAPPING) {
+    return this._commandOptionsProxy('typeMapping', typeMapping);
+  }
+
+  async _execute<T>(
+    isReadonly: boolean | undefined,
+    fn: (client: RedisClient<RedisModules, RedisFunctions, RedisScripts, RespVersions, TypeMapping>) => Promise<T>
+  ): Promise<T> {
+    if (this._self.#clientInfo === undefined) {
+      throw new Error("Attempted execution on released RedisSentinelClient lease");
+    }
+
+    return await this._self.#internal.execute(fn, this._self.#clientInfo);
+  }
+
+  async sendCommand<T = ReplyUnion>(
+    isReadonly: boolean | undefined,
+    args: CommandArguments,
+    options?: CommandOptions,
+  ): Promise<T> {
+    const mergedOptions = { ...this.commandOptions, ...options };
+    return this._execute(
+      isReadonly,
+      client => client.sendCommand(args, mergedOptions)
+    );
+  }
+
+  /**
+   * @internal
+   */
+  async _executePipeline(
+    isReadonly: boolean | undefined,
+    commands: Array<RedisMultiQueuedCommand>
+  ) {
+    return this._execute(
+      isReadonly,
+      client => client._executePipeline(commands)
+    );
+  }
+
+  /**f
+    * @internal
+    */
+  async _executeMulti(
+    isReadonly: boolean | undefined,
+    commands: Array<RedisMultiQueuedCommand>
+  ) {
+    return this._execute(
+      isReadonly,
+      client => client._executeMulti(commands)
+    );
+  }
+
+  MULTI(): RedisSentinelMultiCommandType<[], M, F, S, RESP, TYPE_MAPPING> {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return new (this as any).Multi(this);
+  }
+
+  multi = this.MULTI;
+
+  WATCH(key: RedisVariadicArgument) {
+    if (this._self.#clientInfo === undefined) {
+      throw new Error("Attempted execution on released RedisSentinelClient lease");
+    }
+
+    // Apply the sentinel's `keyPrefix` here: the underlying node client carries no
+    // prefix (it receives already-prefixed args for normal commands), so WATCH must be
+    // prefixed at this level to guard the same key the transaction operates on.
+    const watchKeys = prefixKeys(this._self._keyPrefix, key);
+    return this._execute(
+      false,
+      client => client.watch(watchKeys)
+    )
+  }
+
+  watch = this.WATCH;
+
+  UNWATCH() {
+    if (this._self.#clientInfo === undefined) {
+      throw new Error('Attempted execution on released RedisSentinelClient lease');
+    }
+
+    return this._execute(
+      false,
+      client => client.unwatch()
+    )
+  }
+
+  unwatch = this.UNWATCH;
+
+  /**
+   * Releases the client lease back to the pool
+   *
+   * After calling this method, the client instance should no longer be used as it
+   * will be returned to the client pool and may be given to other operations.
+   *
+   * @returns A promise that resolves when the client is ready to be reused, or undefined
+   *          if the client was immediately ready
+   * @throws Error if the lease has already been released
+   */
+  release() {
+    if (this._self.#clientInfo === undefined) {
+      throw new Error('RedisSentinelClient lease already released');
+    }
+
+    const result = this._self.#internal.releaseClientLease(this._self.#clientInfo);
+    this._self.#clientInfo = undefined;
+    return result;
+  }
+}
+
+export default class RedisSentinel<
+  M extends RedisModules,
+  F extends RedisFunctions,
+  S extends RedisScripts,
+  RESP extends RespVersions,
+  TYPE_MAPPING extends TypeMapping
+> extends EventEmitter {
+  readonly _self: RedisSentinel<M, F, S, RESP, TYPE_MAPPING>;
+
+  #internal: RedisSentinelInternal<M, F, S, RESP, TYPE_MAPPING>;
+  #options: RedisSentinelOptions<M, F, S, RESP, TYPE_MAPPING>;
+  readonly #identity: ClientIdentity;
+
+  /**
+   * Indicates if the sentinel connection is open
+   *
+   * @returns `true` if the sentinel connection is open, `false` otherwise
+   */
+  get isOpen() {
+    return this._self.#internal.isOpen;
+  }
+
+  /**
+   * Indicates if the sentinel connection is ready to accept commands
+   *
+   * @returns `true` if the sentinel connection is ready, `false` otherwise
+   */
+  get isReady() {
+    return this._self.#internal.isReady;
+  }
+
+  get commandOptions() {
+    return this._commandOptions !== undefined
+      ? { ...this._self.#commandOptions, ...this._commandOptions }
+      : this._self.#commandOptions;
+  }
+
+  /**
+   * @internal
+   * Returns the sentinel identity for tracking in metrics.
+   */
+  get identity(): ClientIdentity {
+    return this._self.#identity;
+  }
+
+  #commandOptions?: CommandOptions<TYPE_MAPPING>;
+  private _commandOptions?: CommandOptions<TYPE_MAPPING>;
+
+  #trace: (msg: string) => unknown = () => { };
+
+  #reservedClientInfo?: ClientInfo;
+  #masterClientCount = 0;
+  #masterClientInfo?: ClientInfo;
+  #masterClientLease?: Promise<ClientInfo>;
+
+  get clientSideCache() {
+    return this._self.#internal.clientSideCache;
+  }
+
+  /**
+   * The configured key prefix (see {@link RedisSentinelOptions.keyPrefix}), if any.
+   * @internal
+   */
+  get _keyPrefix(): RedisArgument | undefined {
+    return this._self.#options.keyPrefix;
+  }
+
+  constructor(options: RedisSentinelOptions<M, F, S, RESP, TYPE_MAPPING>) {
+    super();
+
+    this._self = this;
+
+    const firstSentinel = options.sentinelRootNodes[0];
+
+    this.#identity = {
+      id: generateClientId(firstSentinel?.host, firstSentinel?.port, undefined),
+      role: ClientRole.SENTINEL,
+    };
+    this.#options = options;
+
+    this.#commandOptions = { timeout: DEFAULT_COMMAND_TIMEOUT, ...options.commandOptions };
+
+    this.#internal = new RedisSentinelInternal<M, F, S, RESP, TYPE_MAPPING>(options, this.#identity.id);
+    this.#internal.on('error', err => this.emit('error', err));
+    // per-node connection errors (master/replica/sentinel node): without this
+    // re-emit they exist only on the internal, and consumers documented to
+    // observe them — the multi-database failure detector among them — see none
+    this.#internal.on('client-error', (event: ClientErrorEvent) => this.emit('client-error', event));
+
+    /* forward the lifecycle events the internal emits from its open/ready transitions */
+    this.#internal
+      .on('connect', () => this.emit('connect'))
+      .on('ready', () => this.emit('ready'))
+      .on('reconnecting', () => this.emit('reconnecting'))
+      .on('end', () => this.emit('end'));
+
+    /* pass through underling events */
+    /* TODO: perhaps make this a struct and one vent, instead of multiple events */
+    this.#internal.on('topology-change', (event: RedisSentinelEvent) => {
+      if (!this.emit('topology-change', event)) {
+        this._self.#trace(`RedisSentinel: re-emit for topology-change for ${event.type} event returned false`);
+      }
+    });
+  }
+
+  static factory<
+    M extends RedisModules = {},
+    F extends RedisFunctions = {},
+    S extends RedisScripts = {},
+    RESP extends RespVersions = 3,
+    TYPE_MAPPING extends TypeMapping = {}
+  >(config?: SentinelCommander<M, F, S, RESP, TYPE_MAPPING>) {
+    const Sentinel = attachConfig({
+      BaseClass: RedisSentinel,
+      commands: NON_STICKY_COMMANDS,
+      createCommand: createCommand<ProxySentinel>,
+      createModuleCommand: createModuleCommand<NamespaceProxySentinel>,
+      createFunctionCommand: createFunctionCommand<NamespaceProxySentinel>,
+      createScriptCommand: createScriptCommand<ProxySentinel>,
+      config
+    });
+
+    Sentinel.prototype.Multi = RedisSentinelMultiCommand.extend(config);
+
+    return (options: Omit<RedisSentinelOptions, keyof Exclude<typeof config, undefined>>) => {
+      // returning a "proxy" to prevent the namespaces.self to leak between "proxies"
+      return Object.create(new Sentinel(options)) as RedisSentinelType<M, F, S, RESP, TYPE_MAPPING>;
+    };
+  }
+
+  static create<
+    M extends RedisModules = {},
+    F extends RedisFunctions = {},
+    S extends RedisScripts = {},
+    RESP extends RespVersions = 3,
+    TYPE_MAPPING extends TypeMapping = {}
+  >(options: RedisSentinelOptions<M, F, S, RESP, TYPE_MAPPING>) {
+    return RedisSentinel.factory(options)(options);
+  }
+
+  withCommandOptions<
+    OPTIONS extends CommandOptions<TYPE_MAPPING>,
+    TYPE_MAPPING extends TypeMapping,
+  >(options: OPTIONS) {
+    const proxy = Object.create(this);
+    proxy._commandOptions = options;
+    return proxy as RedisSentinelType<
+      M,
+      F,
+      S,
+      RESP,
+      TYPE_MAPPING extends TypeMapping ? TYPE_MAPPING : {}
+    >;
+  }
+
+  private _commandOptionsProxy<
+    K extends keyof CommandOptions,
+    V extends CommandOptions[K]
+  >(
+    key: K,
+    value: V
+  ) {
+    const proxy = Object.create(this);
+    proxy._commandOptions = { ...this.commandOptions, [key]: value };
+    return proxy as RedisSentinelType<
+      M,
+      F,
+      S,
+      RESP,
+      K extends 'typeMapping' ? V extends TypeMapping ? V : {} : TYPE_MAPPING
+    >;
+  }
+
+  /**
+   * Override the `typeMapping` command option
+   */
+  withTypeMapping<TYPE_MAPPING extends TypeMapping>(typeMapping: TYPE_MAPPING) {
+    return this._commandOptionsProxy('typeMapping', typeMapping);
+  }
+
+  duplicate<
+    _M extends RedisModules = M,
+    _F extends RedisFunctions = F,
+    _S extends RedisScripts = S,
+    _RESP extends RespVersions = RESP,
+    _TYPE_MAPPING extends TypeMapping = TYPE_MAPPING
+  >(overrides?: Partial<RedisSentinelOptions<_M, _F, _S, _RESP, _TYPE_MAPPING>>) {
+    return new (Object.getPrototypeOf(this).constructor)({
+      ...this._self.#options,
+      commandOptions: this.commandOptions,
+      ...overrides
+    }) as RedisSentinelType<_M, _F, _S, _RESP, _TYPE_MAPPING>;
+  }
+
+  async connect() {
+    await this._self.#internal.connect();
+
+    if (this._self.#options.reserveClient) {
+      this._self.#reservedClientInfo = await this._self.#internal.getClientLease();
+    }
+
+    return this as unknown as RedisSentinelType<M, F, S, RESP, TYPE_MAPPING>;
+  }
+
+  async _execute<T>(
+    isReadonly: boolean | undefined,
+    fn: (client: RedisClient<RedisModules, RedisFunctions, RedisScripts, RespVersions, TypeMapping>) => Promise<T>
+  ): Promise<T> {
+    let clientInfo: ClientInfo | undefined;
+    if (!isReadonly || !this._self.#internal.useReplicas) {
+      if (this._self.#reservedClientInfo) {
+        clientInfo = this._self.#reservedClientInfo;
+      } else {
+        this._self.#masterClientCount++;
+        this._self.#masterClientLease ??= this._self.#internal.getClientLease();
+        clientInfo = this._self.#masterClientInfo = await this._self.#masterClientLease;
+      }
+    }
+
+    try {
+      return await this._self.#internal.execute(fn, clientInfo);
+    } finally {
+      if (
+        clientInfo !== undefined &&
+        clientInfo === this._self.#masterClientInfo &&
+        --this._self.#masterClientCount === 0
+      ) {
+        const promise = this._self.#internal.releaseClientLease(clientInfo);
+        this._self.#masterClientInfo = undefined;
+        this._self.#masterClientLease = undefined;
+        if (promise) await promise;
+      }
+    }
+  }
+
+  async use<T>(fn: (sentinelClient: RedisSentinelClientType<M, F, S, RESP, TYPE_MAPPING>) => Promise<T>) {
+    const clientInfo = await this._self.#internal.getClientLease();
+
+    try {
+      return await fn(
+        RedisSentinelClient.create(this._self.#options, this._self.#internal, clientInfo, this.commandOptions)
+      );
+    } finally {
+      const promise = this._self.#internal.releaseClientLease(clientInfo);
+      if (promise) await promise;
+    }
+  }
+
+  async sendCommand<T = ReplyUnion>(
+    isReadonly: boolean | undefined,
+    args: CommandArguments,
+    options?: CommandOptions,
+  ): Promise<T> {
+    const mergedOptions = { ...this.commandOptions, ...options };
+    return this._execute(
+      isReadonly,
+      client => client.sendCommand(args, mergedOptions)
+    );
+  }
+
+  /**
+   * @internal
+   */
+  async _executePipeline(
+    isReadonly: boolean | undefined,
+    commands: Array<RedisMultiQueuedCommand>
+  ) {
+    return this._execute(
+      isReadonly,
+      client => client._executePipeline(commands)
+    );
+  }
+
+  /**f
+    * @internal
+    */
+  async _executeMulti(
+    isReadonly: boolean | undefined,
+    commands: Array<RedisMultiQueuedCommand>
+  ) {
+    return this._execute(
+      isReadonly,
+      client => client._executeMulti(commands)
+    );
+  }
+
+  MULTI(): RedisSentinelMultiCommandType<[], M, F, S, RESP, TYPE_MAPPING> {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return new (this as any).Multi(this);
+  }
+
+  multi = this.MULTI;
+
+  async close() {
+    try {
+      await this._self.#internal.close();
+    } finally {
+      // In a finally: internal teardown completes even when an `end` listener
+      // throws, and the lease must not be stranded in that case either.
+      this._self.#releaseReservedLease();
+    }
+  }
+
+  async destroy() {
+    try {
+      await this._self.#internal.destroy();
+    } finally {
+      this._self.#releaseReservedLease();
+    }
+  }
+
+  // The reserved lease's slot must go back to the pool queue (it is only filled at
+  // construction), otherwise a reopening connect() with reserveClient waits forever
+  // for a free client.
+  #releaseReservedLease() {
+    if (this.#reservedClientInfo) {
+      this.#internal.releaseClientLease(this.#reservedClientInfo);
+      this.#reservedClientInfo = undefined;
+    }
+  }
+
+  async SUBSCRIBE<T extends boolean = false>(
+    channels: string | Array<string>,
+    listener: PubSubListener<T>,
+    bufferMode?: T
+  ) {
+    return this._self.#internal.subscribe(channels, listener, bufferMode);
+  }
+
+  subscribe = this.SUBSCRIBE;
+
+  async UNSUBSCRIBE<T extends boolean = false>(
+    channels?: string | Array<string>,
+    listener?: PubSubListener<boolean>,
+    bufferMode?: T
+  ) {
+    return this._self.#internal.unsubscribe(channels, listener, bufferMode);
+  }
+
+  unsubscribe = this.UNSUBSCRIBE;
+
+  async PSUBSCRIBE<T extends boolean = false>(
+    patterns: string | Array<string>,
+    listener: PubSubListener<T>,
+    bufferMode?: T
+  ) {
+    return this._self.#internal.pSubscribe(patterns, listener, bufferMode);
+  }
+
+  pSubscribe = this.PSUBSCRIBE;
+
+  async PUNSUBSCRIBE<T extends boolean = false>(
+    patterns?: string | Array<string>,
+    listener?: PubSubListener<T>,
+    bufferMode?: T
+  ) {
+    return this._self.#internal.pUnsubscribe(patterns, listener, bufferMode);
+  }
+
+  pUnsubscribe = this.PUNSUBSCRIBE;
+
+  async SSUBSCRIBE<T extends boolean = false>(
+    channels: string | Array<string>,
+    listener: PubSubListener<T>,
+    bufferMode?: T
+  ) {
+    return this._self.#internal.sSubscribe(channels, listener, bufferMode);
+  }
+
+  sSubscribe = this.SSUBSCRIBE;
+
+  async SUNSUBSCRIBE<T extends boolean = false>(
+    channels?: string | Array<string>,
+    listener?: PubSubListener<T>,
+    bufferMode?: T
+  ) {
+    return this._self.#internal.sUnsubscribe(channels, listener, bufferMode);
+  }
+
+  sUnsubscribe = this.SUNSUBSCRIBE;
+
+  /**
+   * @internal
+   * Move pub/sub subscriptions between sentinel members on multi-database
+   * failover: {@link _extractPubSubListeners} detaches them from the old
+   * member, {@link _adoptPubSubListeners} re-establishes them on the new one.
+   */
+  _extractPubSubListeners() {
+    return this._self.#internal._extractPubSubListeners();
+  }
+
+  _adoptPubSubListeners(listeners: ReturnType<RedisSentinelInternal<M, F, S, RESP, TYPE_MAPPING>['_extractPubSubListeners']>) {
+    return this._self.#internal._adoptPubSubListeners(listeners);
+  }
+
+  /**
+   * Acquires a master client lease for exclusive operations
+   *
+   * Used when multiple commands need to run on an exclusive client (for example, using `WATCH/MULTI/EXEC`).
+   * The returned client must be released after use with the `release()` method.
+   *
+   * @returns A promise that resolves to a Redis client connected to the master node
+   * @example
+   * ```javascript
+   * const clientLease = await sentinel.acquire();
+   *
+   * try {
+   *   await clientLease.watch('key');
+   *   const resp = await clientLease.multi()
+   *     .get('key')
+   *     .exec();
+   * } finally {
+   *   clientLease.release();
+   * }
+   * ```
+   */
+  async acquire(): Promise<RedisSentinelClientType<M, F, S, RESP, TYPE_MAPPING>> {
+    const clientInfo = await this._self.#internal.getClientLease();
+    return RedisSentinelClient.create(this._self.#options, this._self.#internal, clientInfo, this.commandOptions);
+  }
+
+  getSentinelNode(): RedisNode | undefined {
+    return this._self.#internal.getSentinelNode();
+  }
+
+  getMasterNode(): RedisNode | undefined {
+    return this._self.#internal.getMasterNode();
+  }
+
+  getReplicaNodes(): Map<RedisNode, number> {
+    return this._self.#internal.getReplicaNodes();
+  }
+
+  setTracer(tracer?: Array<string>) {
+    if (tracer) {
+      this._self.#trace = (msg: string) => { tracer.push(msg) };
+    } else {
+      this._self.#trace = () => { };
+    }
+
+    this._self.#internal.setTracer(tracer);
+  }
+
+  /**
+   * Async generator that iterates over keys on the Sentinel master by issuing
+   * paged `SCAN` calls. Yields one array of keys per page until the SCAN cursor
+   * returns to `0`.
+   *
+   * @remarks
+   * With a configured `keyPrefix`, the yielded keys are the **already-prefixed** keys
+   * as stored on the server — replies are never un-prefixed. Passing them straight back
+   * into a key-prefixed command prefixes them a second time (e.g. with `keyPrefix: 'app:'`,
+   * a yielded `'app:foo'` becomes `'app:app:foo'`). Strip the prefix before reusing the
+   * keys, or read them with a client that has no `keyPrefix`.
+   *
+   * The master client lease is acquired for the duration of each `SCAN` call
+   * and released before yielding, so consumers can issue other commands from
+   * inside the `for await` loop body without deadlocking against the iterator
+   * — even with `masterPoolSize: 1`.
+   *
+   * Throws `ScanIteratorInterruptedError` on observed `MASTER_CHANGE`.
+   * Throws the underlying error on any other failure.
+   *
+   * @param options - SCAN options and an optional starting `cursor`. The
+   *   starting cursor is honored only on the first call.
+   * @yields Arrays of keys returned by each `SCAN` page. Pages may be empty.
+   * @throws {ScanIteratorInterruptedError} On observed `MASTER_CHANGE`.
+   */
+  async *scanIterator(
+    this: RedisSentinelType<M, F, S, RESP, TYPE_MAPPING>,
+    options?: ScanOptions & ScanIteratorOptions
+  ) {
+    let cursor: RedisArgument = options?.cursor ?? '0';
+    let masterChanged = false;
+
+    const handleTopologyChange = (event: RedisSentinelEvent) => {
+      if (event.type === 'MASTER_CHANGE') {
+        masterChanged = true;
+      }
+    };
+    this.on('topology-change', handleTopologyChange);
+
+    try {
+      do {
+        if (masterChanged) throw new ScanIteratorInterruptedError();
+
+        // Route through _execute so reserveClient:true reuses the reserved
+        // lease (instead of waiting forever on an empty master pool), and the
+        // lease is released before yielding — consumers can issue other
+        // commands inside the for-await loop without exhausting the pool.
+        let reply;
+        try {
+          reply = await this._execute(
+            false,
+            client => {
+              // Re-check after the lease resolves: a failover may have landed
+              // while waiting on an empty master pool, in which case the lease
+              // now points to a fresh client on the new master and SCAN would
+              // resume with a cursor from the old master.
+              if (masterChanged) throw new ScanIteratorInterruptedError();
+              return (client as RedisClientType<RedisModules, RedisFunctions, RedisScripts, RespVersions, TypeMapping>).scan(cursor, options);
+            }
+          );
+        } catch (err) {
+          // Pass through if already wrapped (from the in-lambda re-check).
+          if (err instanceof ScanIteratorInterruptedError) throw err;
+          // Only wrap when MASTER_CHANGE has been observed; otherwise let the
+          // underlying error propagate. A bare socket disconnect alone is not
+          // sufficient evidence of a failover (could be a transient network
+          // blip on the same master, in which case the cursor is still valid).
+          if (masterChanged) throw new ScanIteratorInterruptedError(err);
+          throw err;
+        }
+
+        cursor = reply.cursor;
+        yield reply.keys;
+        // Cursor may be a Buffer when a Blob String type mapping is in use;
+        // compare by string value so iteration actually terminates.
+      } while (cursor.toString() !== '0');
+    } finally {
+      this.removeListener('topology-change', handleTopologyChange);
+    }
+  }
+}
+
+export class RedisSentinelInternal<
+  M extends RedisModules,
+  F extends RedisFunctions,
+  S extends RedisScripts,
+  RESP extends RespVersions,
+  TYPE_MAPPING extends TypeMapping
+> extends EventEmitter {
+  #isOpen = false;
+
+  get isOpen() {
+    return this.#isOpen;
+  }
+
+  #isReady = false;
+
+  get isReady() {
+    return this.#isReady;
+  }
+
+  /**
+   * Single source of truth for the `#isOpen` transition. Emits `connect` when the
+   * sentinel opens and `end` when it closes, once per real transition, so repeated
+   * `close()`/`destroy()` calls fire `end` at most once.
+   */
+  #setOpen(value: boolean) {
+    if (this.#isOpen === value) return;
+    this.#isOpen = value;
+    this.emit(value ? 'connect' : 'end');
+  }
+
+  /**
+   * Single source of truth for the `#isReady` transition. Emits `ready` when the
+   * sentinel becomes ready. A readiness drop while still open and not tearing down
+   * (an actual topology reconfigure — see `transform()`) emits `reconnecting`; a
+   * drop from `close()`/`destroy()` is silent because `#destroy` is set first.
+   */
+  #setReady(value: boolean) {
+    if (this.#isReady === value) return;
+    // Never flip to ready while tearing down: close()/destroy() set #destroy first,
+    // so an in-flight connect that resolves afterwards stays not-ready and does not
+    // emit `ready` after `end`.
+    if (value && this.#destroy) return;
+    this.#isReady = value;
+    // Route listener exceptions to `error`, but on a fresh microtask: these emits fire
+    // inside #connect()'s topology-retry loop, so emitting `error` synchronously here
+    // would re-throw when there is no `error` listener and be caught by the retry —
+    // mistaken for a discovery failure and silently swallowed. Deferring escapes that
+    // boundary, so the failure surfaces (or crashes on an unhandled `error`) as documented.
+    try {
+      if (value) {
+        this.emit('ready');
+      } else if (this.#isOpen && !this.#destroy) {
+        this.emit('reconnecting');
+      }
+    } catch (err) {
+      queueMicrotask(() => this.emit('error', err));
+    }
+  }
+
+  readonly #name: string;
+  readonly #sentinelClientId: string;
+  readonly #nodeClientOptions: RedisClientOptions<M, F, S, RESP, TYPE_MAPPING, RedisTcpSocketOptions>;
+  readonly #sentinelClientOptions: RedisClientOptions<typeof RedisSentinelModule, RedisFunctions, RedisScripts, RespVersions, TypeMapping, RedisTcpSocketOptions>;
+  readonly #nodeAddressMap?: NodeAddressMap;
+  readonly #scanInterval: number;
+  readonly #passthroughClientErrorEvents: boolean;
+  readonly #RESP?: RespVersions;
+  readonly #keyPrefix?: RedisArgument;
+
+  /**
+   * The configured key prefix (see {@link RedisSentinelOptions.keyPrefix}), if any.
+   * @internal
+   */
+  get keyPrefix(): RedisArgument | undefined {
+    return this.#keyPrefix;
+  }
+
+  #anotherReset = false;
+
+  readonly #sentinelSeedNodes: Array<RedisNode>;
+
+  #sentinelRootNodes: Array<RedisNode>;
+  #sentinelClient?: RedisClientType<RedisModules, RedisFunctions, RedisScripts, RespVersions, TypeMapping>;
+
+  #masterClients: Array<RedisClientType<RedisModules, RedisFunctions, RedisScripts, RespVersions, TypeMapping>> = [];
+  #masterClientQueue: WaitQueue<number>;
+  readonly #masterPoolSize: number;
+
+  #replicaClients: Array<RedisClientType<RedisModules, RedisFunctions, RedisScripts, RespVersions, TypeMapping>> = [];
+  #replicaClientsIdx: number = 0;
+  readonly #replicaPoolSize: number;
+
+  get useReplicas() {
+    return this.#replicaPoolSize > 0;
+  }
+
+  #connectPromise?: Promise<void>;
+  #teardownPromise?: Promise<void>;
+  // Kind of the in-flight teardown, so a destroy() can tell whether it is overlapping a
+  // graceful close() (which it must preempt) or another destroy() (which it just joins).
+  #teardownKind?: 'close' | 'destroy';
+  // Set by #doClose() while it waits for command queues to drain; a preempting destroy()
+  // calls it to abandon the drain and force-destroy the clients immediately.
+  #escalateToDestroy?: () => void;
+  #maxCommandRediscovers: number;
+  readonly #pubSubProxy: PubSubProxy;
+
+  #scanTimer?: NodeJS.Timeout
+
+  #destroy = false;
+
+  #trace: (msg: string) => unknown = () => { };
+
+  #clientSideCache?: PooledClientSideCacheProvider;
+  get clientSideCache() {
+    return this.#clientSideCache;
+  }
+
+  #validateOptions(options?: RedisSentinelOptions<M, F, S, RESP, TYPE_MAPPING>) {
+    if (options?.clientSideCache && (options?.RESP ?? DEFAULT_RESP) !== 3) {
+      throw new Error('Client Side Caching is only supported with RESP3');
+    }
+  }
+
+  constructor(options: RedisSentinelOptions<M, F, S, RESP, TYPE_MAPPING>, sentinelClientId: string) {
+    super();
+
+    this.#validateOptions(options);
+
+    this.#name = options.name;
+    this.#sentinelClientId = sentinelClientId;
+
+    this.#RESP = options.RESP;
+    this.#keyPrefix = options.keyPrefix;
+    this.#sentinelSeedNodes = Array.from(options.sentinelRootNodes);
+    // Initial root nodes start as a copy of the seed nodes; transform() later
+    // merges discovered nodes on top while preserving these seeds.
+    this.#sentinelRootNodes = Array.from(this.#sentinelSeedNodes);
+    this.#maxCommandRediscovers = options.maxCommandRediscovers ?? 16;
+    this.#masterPoolSize = options.masterPoolSize ?? 1;
+    this.#replicaPoolSize = options.replicaPoolSize ?? 0;
+    this.#nodeAddressMap = options.nodeAddressMap;
+    this.#scanInterval = options.scanInterval ?? 0;
+    this.#passthroughClientErrorEvents = options.passthroughClientErrorEvents ?? false;
+
+    this.#nodeClientOptions = (options.nodeClientOptions ? {...options.nodeClientOptions} : {}) as RedisClientOptions<M, F, S, RESP, TYPE_MAPPING, RedisTcpSocketOptions>;
+    if (this.#nodeClientOptions.url !== undefined) {
+      throw new Error("invalid nodeClientOptions for Sentinel");
+    }
+    // One fieldset registry across master/replica node clients: fieldsets registered before
+    // a failover must be transparently re-preparable on the promoted master's connections.
+    // (Sentinel-monitor clients use #sentinelClientOptions and never run HIMPORT.)
+    this.#nodeClientOptions.himportRegistry = new FieldsetRegistry();
+
+    if (options.clientSideCache) {
+      if (options.clientSideCache instanceof PooledClientSideCacheProvider) {
+        this.#clientSideCache = this.#nodeClientOptions.clientSideCache = options.clientSideCache;
+      } else {
+        const cscConfig = options.clientSideCache;
+        this.#clientSideCache = this.#nodeClientOptions.clientSideCache = new BasicPooledClientSideCache(cscConfig);
+//        this.#clientSideCache = this.#nodeClientOptions.clientSideCache = new PooledNoRedirectClientSideCache(cscConfig);
+      }
+    }
+
+    this.#sentinelClientOptions = options.sentinelClientOptions ? Object.assign({} as RedisClientOptions<typeof RedisSentinelModule, F, S, RESP, TYPE_MAPPING, RedisTcpSocketOptions>, options.sentinelClientOptions) : {};
+    this.#sentinelClientOptions.modules = RedisSentinelModule;
+
+    if (this.#sentinelClientOptions.url !== undefined) {
+      throw new Error("invalid sentinelClientOptions for Sentinel");
+    }
+
+    this.#masterClientQueue = new WaitQueue();
+    for (let i = 0; i < this.#masterPoolSize; i++) {
+      this.#masterClientQueue.push(i);
+    }
+
+    /* persistent object for life of sentinel object */
+    this.#pubSubProxy = new PubSubProxy(
+      this.#nodeClientOptions,
+      err => this.emit('error', err)
+    );
+  }
+
+  #createClient(
+    node: RedisNode,
+    clientOptions: AnyRedisClientOptions,
+    reconnectStrategy?: false
+  ) {
+    const socket = getMappedNode(node.host, node.port, this.#nodeAddressMap);
+    const client = RedisClient.create({
+      //first take the globally set RESP
+      RESP: this.#RESP,
+      //then take the client options, which can in theory overwrite it
+      ...clientOptions,
+      socket: {
+        ...clientOptions.socket,
+        host: socket.host,
+        port: socket.port,
+        ...(reconnectStrategy !== undefined && { reconnectStrategy })
+      }
+    });
+    client._setIdentity(ClientRole.SENTINEL_CLIENT, this.#sentinelClientId);
+    return client;
+  }
+
+  /**
+   * Waits for a node client's `connect()`, rejecting on the first connection
+   * error instead of waiting for the client to settle.
+   *
+   * Master and replica clients keep the caller's `reconnectStrategy`, which by
+   * default retries forever, so when the resolved node is unreachable (e.g. a
+   * TLS misconfiguration, or a firewalled address — see #3066) their
+   * `connect()` promise never settles and `transform()` would await it
+   * indefinitely. Rejecting on the first connection error hands the failure to
+   * `#connect()`'s retry loop, which re-discovers the topology and, while not
+   * yet ready, gives up after `maxCommandRediscovers` attempts so the public
+   * `connect()` rejects instead of hanging. Per-attempt errors are still
+   * surfaced through the existing `client-error` event (and `error` with
+   * `passthroughClientErrorEvents`), unchanged.
+   */
+  #connectOrFail(client: RedisClientType<RedisModules, RedisFunctions, RedisScripts, RespVersions, TypeMapping>) {
+    return new Promise<unknown>((resolve, reject) => {
+      const onError = (err: Error) => reject(err);
+      client.once('error', onError);
+      client.connect()
+        .then(resolve, reject)
+        .finally(() => client.off('error', onError));
+    });
+  }
+
+  /**
+   * Gets a client lease from the master client pool
+   *
+   * @returns A client info object or a promise that resolves to a client info object
+   *          when a client becomes available
+   */
+  getClientLease(): Promise<ClientInfo> {
+    const id = this.#masterClientQueue.shift();
+    if (id !== undefined) {
+      return Promise.resolve({ id });
+    }
+
+    return this.#masterClientQueue.wait().then(id => ({ id }));
+  }
+
+  /**
+   * Releases a client lease back to the pool
+   *
+   * If the client was used for a transaction that might have left it in a dirty state,
+   * it will be reset before being returned to the pool.
+   *
+   * @param clientInfo The client info object representing the client to release
+   * @returns A promise that resolves when the client is ready to be reused, or undefined
+   *          if the client was immediately ready or no longer exists
+   */
+  releaseClientLease(clientInfo: ClientInfo) {
+    const client = this.#masterClients[clientInfo.id];
+    // client can be undefined if releasing in middle of a reconfigure
+    if (client !== undefined) {
+      const dirtyPromise = client.resetIfDirty();
+      if (dirtyPromise) {
+        return dirtyPromise
+          .then(() => this.#masterClientQueue.push(clientInfo.id));
+      }
+    }
+
+    this.#masterClientQueue.push(clientInfo.id);
+  }
+
+  async connect() {
+    if (this.#isOpen) {
+      throw new Error("already attempting to open")
+    }
+
+    // Assign #connectPromise before emitting `connect`, so a listener that calls
+    // close()/destroy() from within the event awaits the in-flight attempt instead
+    // of tearing down before it starts. Readiness (and `ready`) is set by #connect().
+    const connectPromise = this.#connect();
+    try {
+      this.#connectPromise = connectPromise;
+      this.#setOpen(true);
+      await connectPromise;
+    } catch (err) {
+      // The initial connect gave up. Tear down whatever was created along the
+      // way: clients whose first connection attempt failed keep reconnecting
+      // per their `reconnectStrategy`, and would otherwise stay alive in the
+      // background (holding sockets and timers) after `connect()` rejected.
+      // Keep #connectPromise assigned so destroy() awaits the attempt — it is
+      // still in flight when a `connect` listener threw; the finally clears it.
+      await this.destroy();
+      throw err;
+    } finally {
+      // Clear only if still ours: an `end` listener may have started a reentrant
+      // connect() whose in-flight promise must stay tracked for close()/destroy().
+      if (this.#connectPromise === connectPromise) {
+        this.#connectPromise = undefined;
+      }
+      if (this.#isReady && this.#scanInterval > 0) {
+        this.#scanTimer = setInterval(this.#resetInBackground.bind(this), this.#scanInterval);
+      }
+    }
+  }
+
+  async #connect() {
+    let count = 0;
+    while (true) {
+      this.#trace("starting connect loop");
+
+      if (this.#destroy) {
+        this.#trace("in #connect and want to destroy")
+        return;
+      }
+      try {
+        this.#anotherReset = false;
+        await this.transform(this.analyze(await this.observe()));
+        if (this.#anotherReset) {
+          this.#trace("#connect: anotherReset is true, so continuing");
+          continue;
+        }
+
+        // Topology is connected: (re)assert readiness. Emits `ready` only on a real
+        // transition, so an initial connect and the tail of a failover both emit it,
+        // while a healthy periodic scan that changed nothing stays silent.
+        this.#setReady(true);
+
+        this.#trace("#connect: returning");
+        return;
+      } catch (e) {
+        const err = e as Error;
+        this.#trace(`#connect: exception ${err.message}`);
+        if (++count > this.#maxCommandRediscovers) {
+          throw e;
+        }
+
+        await setTimeout(1000);
+      } finally {
+        this.#trace("finished connect");
+      }
+    }
+  }
+
+  async execute<T>(
+    fn: (client: RedisClientType<RedisModules, RedisFunctions, RedisScripts, RespVersions, TypeMapping>) => Promise<T>,
+    clientInfo?: ClientInfo
+  ): Promise<T> {
+    let iter = 0;
+
+    while (true) {
+      if (this.#connectPromise !== undefined) {
+        await this.#connectPromise;
+      }
+
+      const client = this.#getClient(clientInfo);
+
+      if (!client.isReady) {
+        await this.#reset();
+        continue;
+      }
+      const sockOpts = client.options?.socket as TcpNetConnectOpts | undefined;
+      this.#trace("attemping to send command to " + sockOpts?.host + ":" + sockOpts?.port)
+
+      try {
+        /*
+                // force testing of READONLY errors
+                if (clientInfo !== undefined) {
+                  if (Math.floor(Math.random() * 10) < 1) {
+                    console.log("throwing READONLY error");
+                    throw new Error("READONLY You can't write against a read only replica.");
+                  }
+                }
+        */
+        return await fn(client);
+      } catch (err) {
+        if (++iter > this.#maxCommandRediscovers || !(err instanceof Error)) {
+          throw err;
+        }
+
+        /*
+          rediscover and retry if doing a command against a "master"
+          a) READONLY error (topology has changed) but we haven't been notified yet via pubsub
+          b) client is "not ready" (disconnected), which means topology might have changed, but sentinel might not see it yet
+        */
+        if (clientInfo !== undefined && (err.message.startsWith('READONLY') || !client.isReady)) {
+          await this.#reset();
+          continue;
+        }
+
+        throw err;
+      }
+    }
+  }
+
+  async #createPubSub(client: RedisClientType<RedisModules, RedisFunctions, RedisScripts, RespVersions, TypeMapping>) {
+    /* Whenever sentinels or slaves get added, or when slave configuration changes, reconfigure */
+    await client.pSubscribe(['switch-master', '[-+]sdown', '+slave', '+sentinel', '[-+]odown', '+slave-reconf-done'], (message, channel) => {
+      this.#handlePubSubControlChannel(channel, message);
+    }, true);
+
+    return client;
+  }
+
+  #handlePubSubControlChannel(channel: Buffer, _message: Buffer) {
+    this.#trace("pubsub control channel message on " + channel);
+    this.#resetInBackground();
+  }
+
+  // if clientInfo is defined, it corresponds to a master client in the #masterClients array, otherwise loop around replicaClients
+  #getClient(clientInfo?: ClientInfo): RedisClientType<RedisModules, RedisFunctions, RedisScripts, RespVersions, TypeMapping> {
+    if (clientInfo !== undefined) {
+      return this.#masterClients[clientInfo.id];
+    }
+
+    if (this.#replicaClientsIdx >= this.#replicaClients.length) {
+      this.#replicaClientsIdx = 0;
+    }
+
+    if (this.#replicaClients.length == 0) {
+      throw new Error("no replicas available for read");
+    }
+
+    return this.#replicaClients[this.#replicaClientsIdx++];
+  }
+
+  async #reset() {
+    /* closing / don't reset */
+    if (this.#destroy == true) {
+      return;
+    }
+
+    // Coalesce with an in-flight connect/reset BEFORE the gate below, so a control
+    // event arriving mid-reconfigure still registers via `#anotherReset` and the
+    // running `#connect()` re-observes the newest topology.
+    if (this.#connectPromise !== undefined) {
+      this.#anotherReset = true;
+      return await this.#connectPromise;
+    }
+
+    // Gate on #isOpen, not #isReady: a failover (or a failed one) may have left
+    // readiness false, and later control events must still be able to retry and
+    // eventually re-emit `ready`. #isReady is owned by #connect()/transform(), so a
+    // failed reconfigure honestly stays not-ready rather than falsely reporting ready.
+    if (this.#isOpen == false) {
+      return;
+    }
+
+    const connectPromise = this.#connect();
+    try {
+      this.#connectPromise = connectPromise;
+      return await connectPromise;
+    } finally {
+      this.#trace("finished reconfgure");
+      if (this.#connectPromise === connectPromise) {
+        this.#connectPromise = undefined;
+      }
+    }
+  }
+
+  #resetInBackground() {
+    void this.#reset().catch(err => this.emit('error', err));
+  }
+
+  #sentinelNodeListKey(nodes: Array<RedisNode>) {
+    return nodes.map(node => `${node.host}:${node.port}`).sort().join('|');
+  }
+
+  #restoreSentinelRootNodesIfEmpty() {
+    if (this.#sentinelRootNodes.length !== 0) {
+      return;
+    }
+
+    this.#trace("restoring sentinel roots from seed nodes");
+    this.#sentinelRootNodes = Array.from(this.#sentinelSeedNodes);
+  }
+
+  #handleSentinelFailure(node: RedisNode) {
+    const found = this.#sentinelRootNodes.findIndex(
+        (rootNode) => rootNode.host === node.host && rootNode.port === node.port
+    );
+    if (found !== -1) {
+        this.#sentinelRootNodes.splice(found, 1);
+    }
+    this.#restoreSentinelRootNodesIfEmpty();
+    this.#resetInBackground();
+  }
+
+  /**
+   * Gracefully close the sentinel, waiting for pending commands to drain.
+   *
+   * Serializes with any in-flight teardown: overlapping close()/destroy() calls join it
+   * instead of running a second pass over already-emptied client arrays — a second pass
+   * would emit `end` early and let the tail of the first pass kill a sentinel that a
+   * listener has since reopened.
+   */
+  async close() {
+    return this.#teardown('close');
+  }
+
+  /**
+   * Forcefully destroy the sentinel, rejecting pending commands immediately.
+   *
+   * Coalesces with an in-flight teardown, but a destroy() that overlaps a graceful
+   * close() preempts it: close() can block indefinitely on a draining command queue,
+   * whereas destroy() must terminate now.
+   */
+  async destroy() {
+    return this.#teardown('destroy');
+  }
+
+  #teardown(kind: 'close' | 'destroy') {
+    if (this.#teardownPromise === undefined) {
+      const teardown: Promise<void> = (kind === 'destroy' ? this.#doDestroy() : this.#doClose()).finally(() => {
+        // Guarded like #connectPromise in connect(): an `end` listener may have
+        // started a new teardown generation that must not be wiped.
+        if (this.#teardownPromise === teardown) {
+          this.#teardownPromise = undefined;
+          this.#teardownKind = undefined;
+        }
+      });
+      // #doDestroy()/#doClose() can emit `end` synchronously (an established sentinel with
+      // no in-flight connect runs #doDestroy() to completion before we get here), and an
+      // `end` listener may start a new teardown generation that has already claimed these
+      // fields. Only register ours if nothing newer did — otherwise we would untrack the
+      // reentrant teardown and let a later close()/destroy() race it.
+      if (this.#teardownPromise === undefined) {
+        this.#teardownKind = kind;
+        this.#teardownPromise = teardown;
+      }
+      return teardown;
+    }
+
+    // A destroy() overlapping an in-flight graceful close() must preempt it rather than
+    // joining: force-destroy the draining clients so close() stops waiting. Recording
+    // 'destroy' also covers the window before #doClose() reaches its drain — it will see
+    // the flag and force immediately instead of awaiting.
+    if (kind === 'destroy' && this.#teardownKind === 'close') {
+      this.#teardownKind = 'destroy';
+      this.#escalateToDestroy?.();
+    }
+    return this.#teardownPromise;
+  }
+
+  async #doClose() {
+    this.#destroy = true;
+
+    if (this.#connectPromise != undefined) {
+      await this.#connectPromise.catch(() => undefined);
+    }
+
+    this.#setReady(false);
+
+    this.#clientSideCache?.onPoolClose();
+
+    if (this.#scanTimer) {
+      clearInterval(this.#scanTimer);
+      this.#scanTimer = undefined;
+    }
+
+    const clients: Array<RedisClientType<RedisModules, RedisFunctions, RedisScripts, RespVersions, TypeMapping>> = [];
+    const gracefulClosePromises: Array<Promise<void>> = [];
+
+    if (this.#sentinelClient !== undefined) {
+      if (this.#sentinelClient.isOpen) {
+        clients.push(this.#sentinelClient);
+        gracefulClosePromises.push(this.#sentinelClient.close());
+      }
+      this.#sentinelClient = undefined;
+    }
+
+    for (const client of this.#masterClients) {
+      if (client.isOpen) {
+        clients.push(client);
+        gracefulClosePromises.push(client.close());
+      }
+    }
+
+    this.#masterClients = [];
+
+    for (const client of this.#replicaClients) {
+      if (client.isOpen) {
+        clients.push(client);
+        gracefulClosePromises.push(client.close());
+      }
+    }
+
+    this.#replicaClients = [];
+
+    // Wait for the graceful drain, but let a preempting destroy() abandon it: RedisClient
+    // .close() never settles once the client is destroyed, so we cannot rely on the drain
+    // promises after a force-destroy — race them against an escalation signal instead.
+    await new Promise<void>(resolve => {
+      let settled = false;
+      const forceDestroy = () => {
+        if (settled) return;
+        settled = true;
+        this.#escalateToDestroy = undefined;
+        // close() already flipped each client to isOpen === false while leaving the socket
+        // draining, so an isOpen guard would skip exactly the clients we must terminate.
+        // destroy() force-kills a closing socket; a client whose drain already finished is
+        // fully torn down and throws ClientClosedError — harmless, so swallow it.
+        for (const client of clients) {
+          try {
+            client.destroy();
+          } catch {
+            // already fully closed
+          }
+        }
+        resolve();
+      };
+      // A destroy() may have already preempted while we were setting up (e.g. during the
+      // #connectPromise await above); honor it without waiting on the drain.
+      if (this.#teardownKind === 'destroy') {
+        forceDestroy();
+        return;
+      }
+      this.#escalateToDestroy = forceDestroy;
+      Promise.allSettled(gracefulClosePromises).then(() => {
+        if (settled) return;
+        settled = true;
+        this.#escalateToDestroy = undefined;
+        resolve();
+      });
+    });
+
+    this.#pubSubProxy.destroy();
+
+    // Clear #destroy before emitting `end` (via #setOpen) and before returning, so a
+    // later connect() — or a reentrant connect() from an `end` listener — is not left
+    // half-open by #connect()'s teardown guard. Mirrors destroy(). Also start a new
+    // teardown generation: a close()/destroy() from inside the emit must tear down a
+    // reentrantly reopened sentinel, not join this already-finished pass.
+    this.#destroy = false;
+    this.#teardownPromise = undefined;
+    this.#teardownKind = undefined;
+    this.#setOpen(false);
+  }
+
+  // destroy has to be async because its stopping others async events, timers and the like
+  // and shouldn't return until its finished.
+  async #doDestroy() {
+    this.#destroy = true;
+
+    if (this.#connectPromise != undefined) {
+      await this.#connectPromise.catch(() => undefined);
+    }
+
+    this.#setReady(false);
+
+    this.#clientSideCache?.onPoolClose();
+
+    if (this.#scanTimer) {
+      clearInterval(this.#scanTimer);
+      this.#scanTimer = undefined;
+    }
+
+    if (this.#sentinelClient !== undefined) {
+      if (this.#sentinelClient.isOpen) {
+        this.#sentinelClient.destroy();
+      }
+      this.#sentinelClient = undefined;
+    }
+
+    for (const client of this.#masterClients) {
+      if (client.isOpen) {
+        client.destroy();
+      }
+    }
+    this.#masterClients = [];
+
+    for (const client of this.#replicaClients) {
+      if (client.isOpen) {
+        client.destroy();
+      }
+    }
+    this.#replicaClients = [];
+
+    this.#pubSubProxy.destroy();
+
+    // Clear #destroy before emitting `end` (via #setOpen), so a reentrant connect()
+    // from an `end` listener sees teardown finalized and can reopen cleanly. Also
+    // start a new teardown generation — see #doClose().
+    this.#destroy = false;
+    this.#teardownPromise = undefined;
+    this.#teardownKind = undefined;
+    this.#setOpen(false);
+  }
+
+  async subscribe<T extends boolean = false>(
+    channels: string | Array<string>,
+    listener: PubSubListener<T>,
+    bufferMode?: T
+  ) {
+    return this.#pubSubProxy.subscribe(channels, listener, bufferMode);
+  }
+
+  async unsubscribe<T extends boolean = false>(
+    channels?: string | Array<string>,
+    listener?: PubSubListener<boolean>,
+    bufferMode?: T
+  ) {
+    return this.#pubSubProxy.unsubscribe(channels, listener, bufferMode);
+  }
+
+  async pSubscribe<T extends boolean = false>(
+    patterns: string | Array<string>,
+    listener: PubSubListener<T>,
+    bufferMode?: T
+  ) {
+    return this.#pubSubProxy.pSubscribe(patterns, listener, bufferMode);
+  }
+
+  async pUnsubscribe<T extends boolean = false>(
+    patterns?: string | Array<string>,
+    listener?: PubSubListener<T>,
+    bufferMode?: T
+  ) {
+    return this.#pubSubProxy.pUnsubscribe(patterns, listener, bufferMode);
+  }
+
+  async sSubscribe<T extends boolean = false>(
+    channels: string | Array<string>,
+    listener: PubSubListener<T>,
+    bufferMode?: T
+  ) {
+    return this.#pubSubProxy.sSubscribe(channels, listener, bufferMode);
+  }
+
+  async sUnsubscribe<T extends boolean = false>(
+    channels?: string | Array<string>,
+    listener?: PubSubListener<T>,
+    bufferMode?: T
+  ) {
+    return this.#pubSubProxy.sUnsubscribe(channels, listener, bufferMode);
+  }
+
+  /**
+   * @internal
+   * Move pub/sub subscriptions between sentinel members on multi-database
+   * failover: {@link _extractPubSubListeners} detaches them from the old
+   * member, {@link _adoptPubSubListeners} re-establishes them on the new one.
+   */
+  _extractPubSubListeners() {
+    return this.#pubSubProxy.extractListeners();
+  }
+
+  _adoptPubSubListeners(listeners: ReturnType<PubSubProxy['extractListeners']>) {
+    return this.#pubSubProxy.adoptListeners(listeners);
+  }
+
+  // observe/analyze/transform remediation functions
+  async observe() {
+    this.#restoreSentinelRootNodesIfEmpty();
+
+    for (const node of this.#sentinelRootNodes) {
+      let client: RedisClientType<typeof RedisSentinelModule, {}, {}, RespVersions, {}> | undefined;
+      try {
+        this.#trace(`observe: trying to connect to sentinel: ${node.host}:${node.port}`)
+        client = this.#createClient(node, this.#sentinelClientOptions, false) as unknown as RedisClientType<typeof RedisSentinelModule, {}, {}, RespVersions, {}>;
+        client.on('error', (err) => this.emit('error', `obseve client error: ${err}`));
+        await client.connect();
+        this.#trace(`observe: connected to sentinel`)
+
+        const [sentinelData, masterData, replicaData] = await Promise.all([
+          client.sentinel.sentinelSentinels(this.#name),
+          client.sentinel.sentinelMaster(this.#name),
+          client.sentinel.sentinelReplicas(this.#name)
+        ]);
+
+        this.#trace("observe: got all sentinel data");
+
+        const ret = {
+          sentinelConnected: node,
+          sentinelData: sentinelData,
+          masterData: masterData,
+          replicaData: replicaData,
+          currentMaster: this.getMasterNode(),
+          currentReplicas: this.getReplicaNodes(),
+          currentSentinel: this.getSentinelNode(),
+          replicaPoolSize: this.#replicaPoolSize,
+          useReplicas: this.useReplicas
+        }
+
+        return ret;
+      } catch (err) {
+        this.#trace(`observe: error ${err}`);
+        this.emit('error', err);
+      } finally {
+        if (client !== undefined && client.isOpen) {
+          this.#trace(`observe: destroying sentinel client`);
+          client.destroy();
+        }
+      }
+    }
+
+    this.#trace(`observe: none of the sentinels are available`);
+    throw new Error('None of the sentinels are available');
+  }
+
+  analyze(observed: Awaited<ReturnType<RedisSentinelInternal<M, F, S, RESP, TYPE_MAPPING>["observe"]>>) {
+    let master = parseNode(observed.masterData);
+    if (master === undefined) {
+      this.#trace(`analyze: no valid master node because ${observed.masterData.flags}`);
+      throw new Error("no valid master node");
+    }
+
+    const mappedMaster = getMappedNode(master.host, master.port, this.#nodeAddressMap);
+    if (mappedMaster.host === observed.currentMaster?.host && mappedMaster.port === observed.currentMaster?.port) {
+      this.#trace(`analyze: master node hasn't changed from ${observed.currentMaster?.host}:${observed.currentMaster?.port}`);
+      master = undefined;
+    } else {
+      this.#trace(`analyze: master node has changed to ${master.host}:${master.port} from ${observed.currentMaster?.host}:${observed.currentMaster?.port}`);
+    }
+
+    let sentinel: RedisNode | undefined = observed.sentinelConnected;
+    const mappedSentinel = getMappedNode(sentinel.host, sentinel.port, this.#nodeAddressMap);
+    if (mappedSentinel.host === observed.currentSentinel?.host && mappedSentinel.port === observed.currentSentinel.port) {
+      this.#trace(`analyze: sentinel node hasn't changed`);
+      sentinel = undefined;
+    } else {
+      this.#trace(`analyze: sentinel node has changed to ${sentinel.host}:${sentinel.port}`);
+    }
+
+    const replicasToClose: Array<RedisNode> = [];
+    const replicasToOpen = new Map<RedisNode, number>();
+
+    const desiredMap = new Map<string, RedisNode>();
+    const seen = new Set<string>();
+
+    if (observed.useReplicas) {
+      const replicaList = createNodeList(observed.replicaData)
+
+      for (const node of replicaList) {
+        const mapped = getMappedNode(node.host, node.port, this.#nodeAddressMap);
+        desiredMap.set(JSON.stringify({ host: mapped.host, port: mapped.port }), node);
+      }
+
+      for (const [node, value] of observed.currentReplicas) {
+        const desired = desiredMap.get(JSON.stringify(node));
+        if (desired === undefined) {
+          replicasToClose.push(node);
+          this.#trace(`analyze: adding ${node.host}:${node.port} to replicsToClose`);
+        } else {
+          seen.add(JSON.stringify(node));
+          if (value != observed.replicaPoolSize) {
+            replicasToOpen.set(desired, observed.replicaPoolSize - value);
+            this.#trace(`analyze: adding ${node.host}:${node.port} to replicsToOpen`);
+          }
+        }
+      }
+
+      for (const [key, node] of desiredMap) {
+        if (!seen.has(key)) {
+          replicasToOpen.set(node, observed.replicaPoolSize);
+          this.#trace(`analyze: adding ${node.host}:${node.port} to replicsToOpen`);
+        }
+      }
+    }
+
+    const ret = {
+      sentinelList: [observed.sentinelConnected].concat(createNodeList(observed.sentinelData)),
+      epoch: Number(observed.masterData['config-epoch']),
+
+      sentinelToOpen: sentinel,
+      masterToOpen: master,
+      replicasToClose: replicasToClose,
+      replicasToOpen: replicasToOpen,
+    };
+
+    return ret;
+  }
+
+  async transform(analyzed: ReturnType<RedisSentinelInternal<M, F, S, RESP, TYPE_MAPPING>["analyze"]>) {
+    this.#trace("transform: enter");
+
+    const promises: Array<Promise<unknown>> = [];
+
+    if (analyzed.sentinelToOpen) {
+      this.#trace(`transform: opening a new sentinel`);
+      if (this.#sentinelClient !== undefined && this.#sentinelClient.isOpen) {
+        this.#trace(`transform: destroying old sentinel as open`);
+        this.#sentinelClient.destroy()
+        this.#sentinelClient = undefined;
+      } else {
+        this.#trace(`transform: not destroying old sentinel as not open`);
+      }
+
+      this.#trace(`transform: creating new sentinel to ${analyzed.sentinelToOpen.host}:${analyzed.sentinelToOpen.port}`);
+      const node = analyzed.sentinelToOpen;
+      const client = this.#createClient(analyzed.sentinelToOpen, this.#sentinelClientOptions, false);
+      client.on('error', (err: Error) => {
+        if (this.#passthroughClientErrorEvents) {
+          this.emit('error', new Error(`Sentinel Client (${node.host}:${node.port}): ${err.message}`, { cause: err }));
+        }
+        const event: ClientErrorEvent = {
+          type: 'SENTINEL',
+          node: clientSocketToNode(client.options!.socket!),
+          error: err
+        };
+        this.emit('client-error', event);
+        this.#handleSentinelFailure(node);
+      });
+      this.#sentinelClient = client;
+
+      this.#trace(`transform: adding sentinel client connect() to promise list`);
+      const promise = this.#sentinelClient.connect().then((client) => { return this.#createPubSub(client) });
+      promises.push(promise);
+
+      this.#trace(`created sentinel client to ${analyzed.sentinelToOpen.host}:${analyzed.sentinelToOpen.port}`);
+      const event: RedisSentinelEvent = {
+        type: "SENTINEL_CHANGE",
+        node: analyzed.sentinelToOpen
+      }
+      this.#trace(`transform: emiting topology-change event for sentinel_change`);
+      if (!this.emit('topology-change', event)) {
+        this.#trace(`transform: emit for topology-change for sentinel_change returned false`);
+      }
+    }
+
+    if (analyzed.masterToOpen) {
+      this.#trace(`transform: opening a new master`);
+      // The master actually changed (analyze() leaves masterToOpen undefined otherwise).
+      // If the sentinel was already running and ready, it is now reconfiguring: drop
+      // readiness (emits `reconnecting`). #connect() re-asserts readiness (emits `ready`)
+      // once the new topology is connected. On the initial connect `#isReady` is still
+      // false, so this is a no-op and no `reconnecting` is emitted.
+      this.#setReady(false);
+      const masterPromises = [];
+      const masterWatches: Array<boolean> = [];
+
+      this.#trace(`transform: destroying old masters if open`);
+      for (const client of this.#masterClients) {
+        masterWatches.push(client.isWatching || client.isDirtyWatch);
+
+        if (client.isOpen) {
+          client.destroy()
+        }
+      }
+
+      this.#masterClients = [];
+
+      this.#trace(`transform: creating all master clients and adding connect promises`);
+      for (let i = 0; i < this.#masterPoolSize; i++) {
+        const node = analyzed.masterToOpen;
+        const client = this.#createClient(analyzed.masterToOpen, this.#nodeClientOptions);
+        client.on('error', (err: Error) => {
+          if (this.#passthroughClientErrorEvents) {
+            this.emit('error', new Error(`Master Client (${node.host}:${node.port}): ${err.message}`, { cause: err }));
+          }
+          const event: ClientErrorEvent = {
+            type: "MASTER",
+            node: clientSocketToNode(client.options!.socket!),
+            error: err
+          };
+          this.emit('client-error', event);
+        });
+
+        if (masterWatches[i]) {
+          client.setDirtyWatch("sentinel config changed in middle of a WATCH Transaction");
+        }
+        this.#masterClients.push(client);
+        masterPromises.push(this.#connectOrFail(client));
+
+        this.#trace(`created master client to ${analyzed.masterToOpen.host}:${analyzed.masterToOpen.port}`);
+      }
+
+      this.#trace(`transform: adding promise to change #pubSubProxy node`);
+      const mappedPubSubNode = getMappedNode(analyzed.masterToOpen.host, analyzed.masterToOpen.port, this.#nodeAddressMap);
+      masterPromises.push(this.#pubSubProxy.changeNode(mappedPubSubNode));
+      promises.push(...masterPromises);
+      const event: RedisSentinelEvent = {
+        type: "MASTER_CHANGE",
+        node: analyzed.masterToOpen
+      }
+      this.#trace(`transform: emiting topology-change event for master_change`);
+      if (!this.emit('topology-change', event)) {
+        this.#trace(`transform: emit for topology-change for master_change returned false`);
+      }
+    }
+
+    const replicaCloseSet = new Set<string>();
+    for (const node of analyzed.replicasToClose) {
+      const str = JSON.stringify(node);
+      replicaCloseSet.add(str);
+    }
+
+    const newClientList: Array<RedisClientType<RedisModules, RedisFunctions, RedisScripts, RespVersions, TypeMapping>> = [];
+    const removedSet = new Set<string>();
+
+    for (const replica of this.#replicaClients) {
+      const node = clientSocketToNode(replica.options!.socket!);
+      const str = JSON.stringify(node);
+
+      if (replicaCloseSet.has(str) || !replica.isOpen) {
+        if (replica.isOpen) {
+          const sockOpts = replica.options?.socket as TcpNetConnectOpts | undefined;
+          this.#trace(`destroying replica client to ${sockOpts?.host}:${sockOpts?.port}`);
+          replica.destroy()
+        }
+        if (!removedSet.has(str)) {
+          const event: RedisSentinelEvent = {
+            type: "REPLICA_REMOVE",
+            node: node
+          }
+          this.emit('topology-change', event);
+          removedSet.add(str);
+        }
+      } else {
+        newClientList.push(replica);
+      }
+    }
+    this.#replicaClients = newClientList;
+
+    if (analyzed.replicasToOpen.size != 0) {
+      for (const [node, size] of analyzed.replicasToOpen) {
+        for (let i = 0; i < size; i++) {
+          const client = this.#createClient(node, this.#nodeClientOptions);
+          client.on('error', (err: Error) => {
+            if (this.#passthroughClientErrorEvents) {
+              this.emit('error', new Error(`Replica Client (${node.host}:${node.port}): ${err.message}`, { cause: err }));
+            }
+            const event: ClientErrorEvent = {
+              type: "REPLICA",
+              node: clientSocketToNode(client.options!.socket!),
+              error: err
+            };
+            this.emit('client-error', event);
+          });
+
+          this.#replicaClients.push(client);
+          promises.push(this.#connectOrFail(client));
+
+          this.#trace(`created replica client to ${node.host}:${node.port}`);
+        }
+        const event: RedisSentinelEvent = {
+          type: "REPLICA_ADD",
+          node: node
+        }
+        this.emit('topology-change', event);
+      }
+    }
+
+    const mergedSentinelList = mergeSentinelNodes(this.#sentinelSeedNodes, analyzed.sentinelList);
+
+    if (this.#sentinelNodeListKey(mergedSentinelList) !== this.#sentinelNodeListKey(this.#sentinelRootNodes)) {
+      this.#sentinelRootNodes = mergedSentinelList;
+      const event: RedisSentinelEvent = {
+        type: "SENTINE_LIST_CHANGE",
+        size: mergedSentinelList.length
+      }
+      this.emit('topology-change', event);
+    }
+
+    await Promise.all(promises);
+    this.#trace("transform: exit");
+  }
+
+  // introspection functions
+  getMasterNode(): RedisNode | undefined {
+    if (this.#masterClients.length == 0) {
+      return undefined;
+    }
+
+    for (const master of this.#masterClients) {
+      if (master.isReady) {
+        return clientSocketToNode(master.options!.socket!);
+      }
+    }
+
+    return undefined;
+  }
+
+  getSentinelNode(): RedisNode | undefined {
+    if (this.#sentinelClient === undefined) {
+      return undefined;
+    }
+
+    return clientSocketToNode(this.#sentinelClient.options!.socket!);
+  }
+
+  getReplicaNodes(): Map<RedisNode, number> {
+    const ret = new Map<RedisNode, number>();
+    const initialMap = new Map<string, number>();
+
+    for (const replica of this.#replicaClients) {
+      const node = clientSocketToNode(replica.options!.socket!);
+      const hash = JSON.stringify(node);
+
+      if (replica.isReady) {
+        initialMap.set(hash, (initialMap.get(hash) ?? 0) + 1);
+      } else {
+        if (!initialMap.has(hash)) {
+          initialMap.set(hash, 0);
+        }
+      }
+    }
+
+    for (const [key, value] of initialMap) {
+      ret.set(JSON.parse(key) as RedisNode, value);
+    }
+
+    return ret;
+  }
+
+  setTracer(tracer?: Array<string>) {
+    if (tracer) {
+      this.#trace = (msg: string) => { tracer.push(msg) };
+    } else {
+      // empty function is faster than testing if something is defined or not
+      this.#trace = () => { };
+    }
+  }
+}
+
+export class RedisSentinelFactory extends EventEmitter {
+  options: RedisSentinelOptions;
+  #sentinelRootNodes: Array<RedisNode>;
+  #replicaIdx: number = -1;
+
+  constructor(options: RedisSentinelOptions) {
+    super();
+
+    this.options = options;
+    this.#sentinelRootNodes = options.sentinelRootNodes;
+  }
+
+  async updateSentinelRootNodes() {
+    for (const node of this.#sentinelRootNodes) {
+      const client = RedisClient.create({
+        ...this.options.sentinelClientOptions,
+        socket: {
+          ...this.options.sentinelClientOptions?.socket,
+          host: node.host,
+          port: node.port,
+          reconnectStrategy: false
+        },
+        modules: RedisSentinelModule
+      }).on('error', (err) => this.emit(`updateSentinelRootNodes: ${err}`));
+      try {
+        await client.connect();
+      } catch {
+        if (client.isOpen) {
+          client.destroy();
+        }
+        continue;
+      }
+
+      try {
+        const sentinelData = await client.sentinel.sentinelSentinels(this.options.name);
+        this.#sentinelRootNodes = [node].concat(createNodeList(sentinelData));
+        return;
+      } finally {
+        client.destroy();
+      }
+    }
+
+    throw new Error("Couldn't connect to any sentinel node");
+  }
+
+  async getMasterNode() {
+    let connected = false;
+
+    for (const node of this.#sentinelRootNodes) {
+      const client = RedisClient.create({
+        ...this.options.sentinelClientOptions,
+        socket: {
+          ...this.options.sentinelClientOptions?.socket,
+          host: node.host,
+          port: node.port,
+          reconnectStrategy: false
+        },
+        modules: RedisSentinelModule
+      }).on('error', err => this.emit(`getMasterNode: ${err}`));
+
+      try {
+        await client.connect();
+      } catch {
+        if (client.isOpen) {
+          client.destroy();
+        }
+        continue;
+      }
+
+      connected = true;
+
+      try {
+        const masterData = await client.sentinel.sentinelMaster(this.options.name);
+
+        const master = parseNode(masterData);
+        if (master === undefined) {
+          continue;
+        }
+
+        return master;
+      } finally {
+        client.destroy();
+      }
+    }
+
+    if (connected) {
+      throw new Error("Master Node Not Enumerated");
+    }
+
+    throw new Error("couldn't connect to any sentinels");
+  }
+
+  async getMasterClient() {
+    const master = await this.getMasterNode();
+    const socket = getMappedNode(master.host, master.port, this.options.nodeAddressMap);
+    return RedisClient.create({
+      ...this.options.nodeClientOptions,
+      socket: {
+        ...this.options.nodeClientOptions?.socket,
+        host: socket.host,
+        port: socket.port
+      }
+    });
+  }
+
+  async getReplicaNodes() {
+    let connected = false;
+
+    for (const node of this.#sentinelRootNodes) {
+      const client = RedisClient.create({
+        ...this.options.sentinelClientOptions,
+        socket: {
+          ...this.options.sentinelClientOptions?.socket,
+          host: node.host,
+          port: node.port,
+          reconnectStrategy: false
+        },
+        modules: RedisSentinelModule
+      }).on('error', err => this.emit(`getReplicaNodes: ${err}`));
+
+      try {
+        await client.connect();
+      } catch {
+        if (client.isOpen) {
+          client.destroy();
+        }
+        continue;
+      }
+
+      connected = true;
+
+      try {
+        const replicaData = await client.sentinel.sentinelReplicas(this.options.name);
+
+        const replicas = createNodeList(replicaData);
+        if (replicas.length == 0) {
+          continue;
+        }
+
+        return replicas;
+      } finally {
+        client.destroy();
+      }
+    }
+
+    if (connected) {
+      throw new Error("No Replicas Nodes Enumerated");
+    }
+
+    throw new Error("couldn't connect to any sentinels");
+  }
+
+  async getReplicaClient() {
+    const replicas = await this.getReplicaNodes();
+    if (replicas.length == 0) {
+      throw new Error("no available replicas");
+    }
+
+    this.#replicaIdx++;
+    if (this.#replicaIdx >= replicas.length) {
+      this.#replicaIdx = 0;
+    }
+
+    const replica = replicas[this.#replicaIdx];
+    const socket = getMappedNode(replica.host, replica.port, this.options.nodeAddressMap);
+    return RedisClient.create({
+      ...this.options.nodeClientOptions,
+      socket: {
+        ...this.options.nodeClientOptions?.socket,
+        host: socket.host,
+        port: socket.port
+      }
+    });
+  }
+}

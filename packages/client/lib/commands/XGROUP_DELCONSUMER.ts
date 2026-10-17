@@ -1,0 +1,19 @@
+import { CommandParser } from '../client/parser';
+import { RedisArgument, NumberReply, Command } from '../RESP/types';
+
+/**
+ * Command for removing a consumer from a consumer group
+ */
+export default {
+  parseCommand(
+    parser: CommandParser,
+    key: RedisArgument,
+    group: RedisArgument,
+    consumer: RedisArgument
+  ) {
+    parser.push('XGROUP', 'DELCONSUMER');
+    parser.pushKey(key);
+    parser.push(group, consumer);
+  },
+  transformReply: undefined as unknown as () => NumberReply
+} as const satisfies Command;

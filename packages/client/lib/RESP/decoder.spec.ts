@@ -1,0 +1,532 @@
+import { strict as assert } from 'node:assert';
+import { SinonSpy, spy } from 'sinon';
+import { Decoder, RESP_TYPES } from './decoder';
+import { BlobError, SimpleError } from '../errors';
+import { TypeMapping } from './types';
+import { VerbatimString } from './verbatim-string';
+
+interface Test {
+  toWrite: Buffer;
+  typeMapping?: TypeMapping;
+  replies?: Array<unknown>;
+  errorReplies?: Array<unknown>;
+  pushReplies?: Array<unknown>;
+}
+
+function test(name: string, config: Test) {
+  describe(name, () => {
+    it('single chunk', () => {
+      const setup = setupTest(config);
+      setup.decoder.write(config.toWrite);
+      assertSpiesCalls(config, setup);
+    });
+
+    it('byte by byte', () => {
+      const setup = setupTest(config);
+      for (let i = 0; i < config.toWrite.length; i++) {
+        setup.decoder.write(config.toWrite.subarray(i, i + 1));
+      }
+      assertSpiesCalls(config, setup);
+    });
+  })
+}
+
+function setupTest(config: Test) {
+  const onReplySpy = spy(),
+    onErrorReplySpy = spy(),
+    onPushSpy = spy();
+
+  return {
+    decoder: new Decoder({
+      getTypeMapping: () => config.typeMapping ?? {},
+      onReply: onReplySpy,
+      onErrorReply: onErrorReplySpy,
+      onPush: onPushSpy
+    }),
+    onReplySpy,
+    onErrorReplySpy,
+    onPushSpy
+  };
+}
+
+function assertSpiesCalls(config: Test, spies: ReturnType<typeof setupTest>) {
+  assertSpyCalls(spies.onReplySpy, config.replies);
+  assertSpyCalls(spies.onErrorReplySpy, config.errorReplies);
+  assertSpyCalls(spies.onPushSpy, config.pushReplies);
+}
+
+function assertSpyCalls(spy: SinonSpy, replies?: Array<unknown>) {
+  if (!replies) {
+    assert.equal(spy.callCount, 0);
+    return;
+  }
+
+  assert.equal(spy.callCount, replies.length);
+  for (const [i, reply] of replies.entries()) {
+    assert.deepEqual(
+      spy.getCall(i).args,
+      [reply]
+    );
+  }
+}
+
+describe('RESP Decoder', () => {
+  test('Null', {
+    toWrite: Buffer.from('_\r\n'),
+    replies: [null]
+  });
+
+  describe('Boolean', () => {
+    test('true', {
+      toWrite: Buffer.from('#t\r\n'),
+      replies: [true]
+    });
+
+    test('false', {
+      toWrite: Buffer.from('#f\r\n'),
+      replies: [false]
+    });
+  });
+
+  describe('Number', () => {
+    test('0', {
+      toWrite: Buffer.from(':0\r\n'),
+      replies: [0]
+    });
+
+    test('1', {
+      toWrite: Buffer.from(':+1\r\n'),
+      replies: [1]
+    });
+
+    test('+1', {
+      toWrite: Buffer.from(':+1\r\n'),
+      replies: [1]
+    });
+
+    test('-1', {
+      toWrite: Buffer.from(':-1\r\n'),
+      replies: [-1]
+    });
+
+    test('1 as string', {
+      typeMapping: {
+        [RESP_TYPES.NUMBER]: String
+      },
+      toWrite: Buffer.from(':1\r\n'),
+      replies: ['1']
+    });
+  });
+
+  describe('BigNumber', () => {
+    test('0', {
+      toWrite: Buffer.from('(0\r\n'),
+      replies: [0n]
+    });
+
+    test('1', {
+      toWrite: Buffer.from('(1\r\n'),
+      replies: [1n]
+    });
+
+    test('+1', {
+      toWrite: Buffer.from('(+1\r\n'),
+      replies: [1n]
+    });
+
+    test('-1', {
+      toWrite: Buffer.from('(-1\r\n'),
+      replies: [-1n]
+    });
+
+    test('1 as string', {
+      typeMapping: {
+        [RESP_TYPES.BIG_NUMBER]: String
+      },
+      toWrite: Buffer.from('(1\r\n'),
+      replies: ['1']
+    });
+  });
+
+  describe('Double', () => {
+    test('0', {
+      toWrite: Buffer.from(',0\r\n'),
+      replies: [0]
+    });
+
+    test('1', {
+      toWrite: Buffer.from(',1\r\n'),
+      replies: [1]
+    });
+
+    test('+1', {
+      toWrite: Buffer.from(',+1\r\n'),
+      replies: [1]
+    });
+
+    test('-1', {
+      toWrite: Buffer.from(',-1\r\n'),
+      replies: [-1]
+    });
+
+    test('1.1', {
+      toWrite: Buffer.from(',1.1\r\n'),
+      replies: [1.1]
+    });
+
+    test('nan', {
+      toWrite: Buffer.from(',nan\r\n'),
+      replies: [NaN]
+    });
+
+    test('inf', {
+      toWrite: Buffer.from(',inf\r\n'),
+      replies: [Infinity]
+    });
+
+    test('+inf', {
+      toWrite: Buffer.from(',+inf\r\n'),
+      replies: [Infinity]
+    });
+
+    test('-inf', {
+      toWrite: Buffer.from(',-inf\r\n'),
+      replies: [-Infinity]
+    });
+
+    test('1e1', {
+      toWrite: Buffer.from(',1e1\r\n'),
+      replies: [1e1]
+    });
+
+    test('-1.1E+1', {
+      toWrite: Buffer.from(',-1.1E+1\r\n'),
+      replies: [-1.1E+1]
+    });
+
+    test('1 as string', {
+      typeMapping: {
+        [RESP_TYPES.DOUBLE]: String
+      },
+      toWrite: Buffer.from(',1\r\n'),
+      replies: ['1']
+    });
+
+    // The server writes the shortest representation that round-trips
+    // (`fpconv_dtoa` via `d2string`), so decoding must return the exact same
+    // double — anything else and a score read back differs from the score
+    // stored. These are the values that used to decode a rounding off.
+    describe('round-trips the double the server encoded', () => {
+      test('0.3', {
+        toWrite: Buffer.from(',0.3\r\n'),
+        replies: [0.3]
+      });
+
+      test('99.99', {
+        toWrite: Buffer.from(',99.99\r\n'),
+        replies: [99.99]
+      });
+
+      test('12345.6789', {
+        toWrite: Buffer.from(',12345.6789\r\n'),
+        replies: [12345.6789]
+      });
+
+      test('0.30000000000000004', {
+        toWrite: Buffer.from(',0.30000000000000004\r\n'),
+        replies: [0.30000000000000004]
+      });
+
+      test('-0', {
+        toWrite: Buffer.from(',-0\r\n'),
+        replies: [-0]
+      });
+
+      // 16+ significant digits and exponents exceed the exact path and take
+      // the `Number` fallback.
+      test('3.141592653589793', {
+        toWrite: Buffer.from(',3.141592653589793\r\n'),
+        replies: [3.141592653589793]
+      });
+
+      test('1.2345678901234567e+9', {
+        toWrite: Buffer.from(',1.2345678901234567e+9\r\n'),
+        replies: [1234567890.1234567]
+      });
+
+      // MAX_VALUE used to overflow to Infinity, MIN_VALUE to underflow to 0
+      test('1.7976931348623157e+308 (MAX_VALUE)', {
+        toWrite: Buffer.from(',1.7976931348623157e+308\r\n'),
+        replies: [Number.MAX_VALUE]
+      });
+
+      test('-1.7976931348623157e+308 (-MAX_VALUE)', {
+        toWrite: Buffer.from(',-1.7976931348623157e+308\r\n'),
+        replies: [-Number.MAX_VALUE]
+      });
+
+      test('5e-324 (MIN_VALUE)', {
+        toWrite: Buffer.from(',5e-324\r\n'),
+        replies: [Number.MIN_VALUE]
+      });
+
+      test('2.2250738585072014e-308', {
+        toWrite: Buffer.from(',2.2250738585072014e-308\r\n'),
+        replies: [2.2250738585072014e-308]
+      });
+    });
+  });
+
+  describe('SimpleString', () => {
+    test("'OK'", {
+      toWrite: Buffer.from('+OK\r\n'),
+      replies: ['OK']
+    });
+
+    test("'OK' as Buffer", {
+      typeMapping: {
+        [RESP_TYPES.SIMPLE_STRING]: Buffer
+      },
+      toWrite: Buffer.from('+OK\r\n'),
+      replies: [Buffer.from('OK')]
+    });
+
+    test("'é'", {
+      toWrite: Buffer.from('+é\r\n'),
+      replies: ['é']
+    });
+  });
+
+  describe('BlobString', () => {
+    test("''", {
+      toWrite: Buffer.from('$0\r\n\r\n'),
+      replies: ['']
+    });
+
+    test("'1234567890'", {
+      toWrite: Buffer.from('$10\r\n1234567890\r\n'),
+      replies: ['1234567890']
+    });
+
+    test('null (RESP2 backwards compatibility)', {
+      toWrite: Buffer.from('$-1\r\n'),
+      replies: [null]
+    });
+
+    test("'OK' as Buffer", {
+      typeMapping: {
+        [RESP_TYPES.BLOB_STRING]: Buffer
+      },
+      toWrite: Buffer.from('$2\r\nOK\r\n'),
+      replies: [Buffer.from('OK')]
+    });
+
+    test("'é'", {
+      toWrite: Buffer.from('$2\r\né\r\n'),
+      replies: ['é']
+    });
+  });
+
+  describe('VerbatimString', () => {
+    test("''", {
+      toWrite: Buffer.from('=4\r\ntxt:\r\n'),
+      replies: ['']
+    });
+
+    test("'123456'", {
+      toWrite: Buffer.from('=10\r\ntxt:123456\r\n'),
+      replies: ['123456']
+    });
+
+    test("'OK' as VerbatimString", {
+      typeMapping: {
+        [RESP_TYPES.VERBATIM_STRING]: VerbatimString
+      },
+      toWrite: Buffer.from('=6\r\ntxt:OK\r\n'),
+      replies: [new VerbatimString('txt', 'OK')]
+    });
+
+    test("'OK' as Buffer", {
+      typeMapping: {
+        [RESP_TYPES.VERBATIM_STRING]: Buffer
+      },
+      toWrite: Buffer.from('=6\r\ntxt:OK\r\n'),
+      replies: [Buffer.from('OK')]
+    });
+
+    test("'é'", {
+      toWrite: Buffer.from('=6\r\ntxt:é\r\n'),
+      replies: ['é']
+    });
+  });
+
+  test('SimpleError', {
+    toWrite: Buffer.from('-ERROR\r\n'),
+    errorReplies: [new SimpleError('ERROR')]
+  });
+
+  test('BlobError', {
+    toWrite: Buffer.from('!5\r\nERROR\r\n'),
+    errorReplies: [new BlobError('ERROR')]
+  });
+
+  describe('Array', () => {
+    test('[]', {
+      toWrite: Buffer.from('*0\r\n'),
+      replies: [[]]
+    });
+
+    test('[0..9]', {
+      toWrite: Buffer.from(`*10\r\n:0\r\n:1\r\n:2\r\n:3\r\n:4\r\n:5\r\n:6\r\n:7\r\n:8\r\n:9\r\n`),
+      replies: [[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]]
+    });
+
+    test('with all types', {
+      toWrite: Buffer.from([
+        '*13\r\n',
+        '_\r\n',
+        '#f\r\n',
+        ':0\r\n',
+        '(0\r\n',
+        ',0\r\n',
+        '+\r\n',
+        '$0\r\n\r\n',
+        '=4\r\ntxt:\r\n',
+        '-\r\n',
+        '!0\r\n\r\n',
+        '*0\r\n',
+        '~0\r\n',
+        '%0\r\n'
+      ].join('')),
+      replies: [[
+        null,
+        false,
+        0,
+        0n,
+        0,
+        '',
+        '',
+        '',
+        new SimpleError(''),
+        new BlobError(''),
+        [],
+        [],
+        {}
+      ]]
+    });
+
+    test('null (RESP2 backwards compatibility)', {
+      toWrite: Buffer.from('*-1\r\n'),
+      replies: [null]
+    });
+  });
+
+  describe('Set', () => {
+    test('empty', {
+      toWrite: Buffer.from('~0\r\n'),
+      replies: [[]]
+    });
+
+    test('of 0..9', {
+      toWrite: Buffer.from(`~10\r\n:0\r\n:1\r\n:2\r\n:3\r\n:4\r\n:5\r\n:6\r\n:7\r\n:8\r\n:9\r\n`),
+      replies: [[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]]
+    });
+
+    test('0..9 as Set', {
+      typeMapping: {
+        [RESP_TYPES.SET]: Set
+      },
+      toWrite: Buffer.from(`~10\r\n:0\r\n:1\r\n:2\r\n:3\r\n:4\r\n:5\r\n:6\r\n:7\r\n:8\r\n:9\r\n`),
+      replies: [new Set([0, 1, 2, 3, 4, 5, 6, 7, 8, 9])]
+    });
+  });
+
+  describe('Map', () => {
+    test('{}', {
+      toWrite: Buffer.from('%0\r\n'),
+      replies: [{}]
+    });
+
+    test("{ '0'..'9': <key> }", {
+      toWrite: Buffer.from(`%10\r\n+0\r\n+0\r\n+1\r\n+1\r\n+2\r\n+2\r\n+3\r\n+3\r\n+4\r\n+4\r\n+5\r\n+5\r\n+6\r\n+6\r\n+7\r\n+7\r\n+8\r\n+8\r\n+9\r\n+9\r\n`),
+      replies: [Object.defineProperties({}, {
+        0: { value: '0', enumerable: true },
+        1: { value: '1', enumerable: true },
+        2: { value: '2', enumerable: true },
+        3: { value: '3', enumerable: true },
+        4: { value: '4', enumerable: true },
+        5: { value: '5', enumerable: true },
+        6: { value: '6', enumerable: true },
+        7: { value: '7', enumerable: true },
+        8: { value: '8', enumerable: true },
+        9: { value: '9', enumerable: true }
+      })]
+    });
+
+    test("{ '0'..'9': <key> } as Map", {
+      typeMapping: {
+        [RESP_TYPES.MAP]: Map
+      },
+      toWrite: Buffer.from(`%10\r\n+0\r\n+0\r\n+1\r\n+1\r\n+2\r\n+2\r\n+3\r\n+3\r\n+4\r\n+4\r\n+5\r\n+5\r\n+6\r\n+6\r\n+7\r\n+7\r\n+8\r\n+8\r\n+9\r\n+9\r\n`),
+      replies: [new Map([
+        ['0', '0'],
+        ['1', '1'],
+        ['2', '2'],
+        ['3', '3'],
+        ['4', '4'],
+        ['5', '5'],
+        ['6', '6'],
+        ['7', '7'],
+        ['8', '8'],
+        ['9', '9']
+      ])]
+    });
+
+    test("{ '0'..'9': <key> } as Array", {
+      typeMapping: {
+        [RESP_TYPES.MAP]: Array
+      },
+      toWrite: Buffer.from(`%10\r\n+0\r\n+0\r\n+1\r\n+1\r\n+2\r\n+2\r\n+3\r\n+3\r\n+4\r\n+4\r\n+5\r\n+5\r\n+6\r\n+6\r\n+7\r\n+7\r\n+8\r\n+8\r\n+9\r\n+9\r\n`),
+      replies: [['0', '0', '1', '1', '2', '2', '3', '3', '4', '4', '5', '5', '6', '6', '7', '7', '8', '8', '9', '9']]
+    });
+  });
+
+  describe('Push', () => {
+    test('[]', {
+      toWrite: Buffer.from('>0\r\n'),
+      pushReplies: [[]]
+    });
+
+    test('[0..9]', {
+      toWrite: Buffer.from(`>10\r\n:0\r\n:1\r\n:2\r\n:3\r\n:4\r\n:5\r\n:6\r\n:7\r\n:8\r\n:9\r\n`),
+      pushReplies: [[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]]
+    });
+  });
+
+  it('keeps decoding the chunk when a callback throws', () => {
+    // Regression: the error stopped write(), and the rest of the chunk was lost
+    const pushError = new Error('push listener error'),
+      nullError = new Error('reply listener error'),
+      onPush = spy(() => {
+        throw pushError;
+      }),
+      onReply = spy((reply: unknown) => {
+        if (reply === null) throw nullError;
+      }),
+      decoder = new Decoder({
+        getTypeMapping: () => ({}),
+        onReply,
+        onErrorReply: spy(),
+        onPush
+      });
+
+    assert.equal(decoder.write(Buffer.from('>2\r\n+mess')), undefined);
+    assert.deepEqual(
+      decoder.write(Buffer.from('age\r\n+1\r\n:1\r\n_\r\n>2\r\n+message\r\n+2\r\n$2\r\nv')),
+      [pushError, nullError, pushError]
+    );
+    assert.equal(decoder.write(Buffer.from('1\r\n')), undefined);
+    assert.deepEqual(onPush.args, [[['message', '1']], [['message', '2']]]);
+    assert.deepEqual(onReply.args, [[1], [null], ['v1']]);
+  });
+});

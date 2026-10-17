@@ -1,0 +1,406 @@
+import EventEmitter from 'node:events';
+import { RedisModules, RedisFunctions, RedisScripts, RespVersions, TypeMapping } from '../RESP/types';
+import { AnyRedisClientOptions } from '../client';
+import { PUBSUB_TYPE, PubSubListener, PubSubTypeListeners } from '../client/pub-sub';
+import { RedisNode } from './types';
+import RedisClient from '../client';
+
+type Client = RedisClient<
+  RedisModules,
+  RedisFunctions,
+  RedisScripts,
+  RespVersions,
+  TypeMapping
+>;
+
+type Subscriptions = Record<
+  PUBSUB_TYPE['CHANNELS'] | PUBSUB_TYPE['PATTERNS'] | PUBSUB_TYPE['SHARDED'],
+  PubSubTypeListeners
+>;
+
+type PubSubState = {
+  client: Client;
+  connectPromise: Promise<Client | undefined> | undefined;
+};
+
+type OnError = (err: unknown) => unknown;
+
+type PendingOp = {
+  /** replays this op's effect onto an extracted snapshot */
+  applyTo: (subscriptions: Subscriptions) => void;
+  /** set once the op reached the inner client, which then tracks it itself */
+  dispatched: boolean;
+  /** set by extractListeners: the intent moved with the extraction, so the
+   * teardown-caused rejection of this dispatch is not a failure */
+  carried: boolean;
+};
+
+function channelsArray(channels: string | Array<string>) {
+  return Array.isArray(channels) ? channels : [channels];
+}
+
+function subscribeOp(
+  type: keyof Subscriptions,
+  channels: string | Array<string>,
+  listener: PubSubListener<boolean>,
+  bufferMode?: boolean
+): PendingOp {
+  return {
+    applyTo: subscriptions => {
+      const typeListeners = subscriptions[type];
+      for (const channel of channelsArray(channels)) {
+        let channelListeners = typeListeners.get(channel);
+        if (!channelListeners) {
+          channelListeners = { unsubscribing: false, buffers: new Set(), strings: new Set() };
+          typeListeners.set(channel, channelListeners);
+        }
+        if (bufferMode) {
+          channelListeners.buffers.add(listener as PubSubListener<true>);
+        } else {
+          channelListeners.strings.add(listener as PubSubListener<false>);
+        }
+      }
+    },
+    dispatched: false,
+    carried: false
+  };
+}
+
+/** Mirrors the listener removal `PubSub.unsubscribe` applies on its reply. */
+function unsubscribeOp(
+  type: keyof Subscriptions,
+  channels?: string | Array<string>,
+  listener?: PubSubListener<boolean>,
+  bufferMode?: boolean
+): PendingOp {
+  return {
+    applyTo: subscriptions => {
+      const typeListeners = subscriptions[type];
+      if (!channels) {
+        typeListeners.clear();
+        return;
+      }
+      for (const channel of channelsArray(channels)) {
+        const channelListeners = typeListeners.get(channel);
+        if (!channelListeners) continue;
+        if (listener) {
+          (bufferMode ? channelListeners.buffers : channelListeners.strings).delete(listener as PubSubListener<true>);
+          if (channelListeners.buffers.size !== 0 || channelListeners.strings.size !== 0) continue;
+        }
+        typeListeners.delete(channel);
+      }
+    },
+    dispatched: false,
+    carried: false
+  };
+}
+
+export class PubSubProxy extends EventEmitter {
+  #clientOptions;
+  #onError;
+
+  #node?: RedisNode;
+  #state?: PubSubState;
+  #subscriptions?: Subscriptions;
+  /** in-flight ops in issuance order — see {@link PubSubProxy.prototype.extractListeners} */
+  readonly #pendingOps = new Set<PendingOp>();
+
+  constructor(
+    clientOptions: AnyRedisClientOptions,
+    onError: OnError
+  ) {
+    super();
+
+    this.#clientOptions = clientOptions;
+    this.#onError = onError;
+  }
+
+  #createClient() {
+    if (this.#node === undefined) {
+      throw new Error("pubSubProxy: didn't define node to do pubsub against");
+    }
+
+    return new RedisClient({
+      ...this.#clientOptions,
+      socket: {
+        ...this.#clientOptions.socket,
+        host: this.#node.host,
+        port: this.#node.port
+      }
+    });
+  }
+
+  async #initiatePubSubClient(withSubscriptions = false) {
+    const client = this.#createClient()
+      .on('error', this.#onError);
+
+    const connectPromise = client.connect()
+      .then(async client => {
+        if (this.#state?.client !== client) {
+          // if pubsub was deactivated while connecting (`this.#pubSubClient === undefined`)
+          // or if the node changed (`this.#pubSubClient.client !== client`)
+          client.destroy();
+          return this.#state?.connectPromise;
+        }
+
+        if (withSubscriptions && this.#subscriptions) {
+          await Promise.all([
+            client.extendPubSubListeners(PUBSUB_TYPE.CHANNELS, this.#subscriptions[PUBSUB_TYPE.CHANNELS]),
+            client.extendPubSubListeners(PUBSUB_TYPE.PATTERNS, this.#subscriptions[PUBSUB_TYPE.PATTERNS]),
+            client.extendPubSubListeners(PUBSUB_TYPE.SHARDED, this.#subscriptions[PUBSUB_TYPE.SHARDED])
+          ]);
+        }
+
+        if (this.#state.client !== client) {
+          // if the node changed (`this.#pubSubClient.client !== client`)
+          client.destroy();
+          return this.#state?.connectPromise;
+        }
+
+        this.#state!.connectPromise = undefined;
+        return client;
+      })
+      .catch(err => {
+        // destroy() leaves a connecting client to finish on its own, so a
+        // later adopt or changeNode may have seated a replacement: clear the
+        // state only if it is still ours, or the stale rejection orphans it
+        if (this.#state?.client === client) {
+          this.#state = undefined;
+        }
+        throw err;
+      });
+
+    this.#state = {
+      client,
+      connectPromise
+    };
+
+    return connectPromise;
+  }
+
+  #getPubSubClient() {
+    if (!this.#state) return this.#initiatePubSubClient();
+
+    return (
+      this.#state.connectPromise ??
+      this.#state.client  
+    );
+  }
+
+  async changeNode(node: RedisNode) {
+    this.#node = node;
+
+    if (!this.#state) return;
+
+    // if `connectPromise` is undefined, `this.#subscriptions` is already set
+    // and `this.#state.client` might not have the listeners set yet
+    if (this.#state.connectPromise === undefined) {
+      this.#subscriptions = {
+        [PUBSUB_TYPE.CHANNELS]: this.#state.client.getPubSubListeners(PUBSUB_TYPE.CHANNELS),
+        [PUBSUB_TYPE.PATTERNS]: this.#state.client.getPubSubListeners(PUBSUB_TYPE.PATTERNS),
+        [PUBSUB_TYPE.SHARDED]: this.#state.client.getPubSubListeners(PUBSUB_TYPE.SHARDED)
+      };
+
+      this.#state.client.destroy();
+    }
+
+    await this.#initiatePubSubClient(true);
+  }
+
+  /**
+   * @internal
+   * Snapshot the current subscriptions and tear down the local pub/sub client.
+   * The multi-database client uses this to move subscriptions to another
+   * sentinel member on failover; detaching here stops the old member
+   * re-delivering to the same listeners after it recovers.
+   */
+  extractListeners(): Subscriptions {
+    // Same precedence as `changeNode`: once `connectPromise` settles the live
+    // client's listener maps are authoritative. Source the snapshot from the
+    // client's `removeAllPubSubListeners()` (not the raw `getPubSubListeners`
+    // maps): it applies the client's in-flight UNSUBSCRIBEs and carries its
+    // in-flight SUBSCRIBEs, so a failover racing an unsubscribe does not
+    // resurrect a leaving channel on the new member. The client is destroyed
+    // just below, so clearing its maps as a side effect is harmless. The
+    // `#subscriptions` snapshot is used only while a connect with a pending
+    // re-subscribe is in flight.
+    const subscriptions: Subscriptions = (this.#state && this.#state.connectPromise === undefined)
+      ? this.#state.client._getQueue().removeAllPubSubListeners()
+      : this.#subscriptions ?? {
+          [PUBSUB_TYPE.CHANNELS]: new Map(),
+          [PUBSUB_TYPE.PATTERNS]: new Map(),
+          [PUBSUB_TYPE.SHARDED]: new Map()
+        };
+
+    // an op parked behind a pending connect lives only in its dispatch closure,
+    // and destroy() below silences or rejects that dispatch. Replay such ops
+    // onto the snapshot in issuance order (a subscribe then an unsubscribe of
+    // the same channel must end unsubscribed) and mark them carried so their
+    // settlement is not reported as a failure. A live inner client already
+    // replayed the ops dispatched to it, so only the rest apply there.
+    const live = this.#state !== undefined && this.#state.connectPromise === undefined;
+    for (const pending of this.#pendingOps) {
+      pending.carried = true;
+      if (!live || !pending.dispatched) pending.applyTo(subscriptions);
+    }
+    // the move consumes the log: a late settle must not replay into a later move
+    this.#pendingOps.clear();
+
+    this.destroy();
+    return subscriptions;
+  }
+
+  /**
+   * @internal
+   * Adopt subscriptions captured from another member's {@link extractListeners}
+   * and re-establish them against this member's current master. No-op when
+   * there is nothing to move.
+   */
+  async adoptListeners(subscriptions: Subscriptions): Promise<void> {
+    if (
+      subscriptions[PUBSUB_TYPE.CHANNELS].size === 0 &&
+      subscriptions[PUBSUB_TYPE.PATTERNS].size === 0 &&
+      subscriptions[PUBSUB_TYPE.SHARDED].size === 0
+    ) {
+      return;
+    }
+
+    this.#subscriptions = subscriptions;
+    await this.#initiatePubSubClient(true);
+  }
+
+  #executeCommand<T>(fn: (client: Client) => T) {
+    const client = this.#getPubSubClient();
+    if (client instanceof RedisClient) {
+      return fn(client);
+    }
+
+    return client.then(client => {
+      // if pubsub was deactivated while connecting
+      if (client === undefined) return;
+
+      return fn(client);
+    }).catch(err => {
+      if (this.#state?.client.isPubSubActive) {
+        // destroy() clears #state AND the adopted #subscriptions snapshot; a
+        // bare client.destroy() would strand the snapshot for extractListeners
+        // to resurrect on the next move
+        this.destroy();
+      }
+
+      throw err;
+    });
+  }
+
+  /** Track an in-flight op for the duration of its dispatch, so
+   * {@link extractListeners} can carry it during that window. */
+  async #tracked<T>(pending: PendingOp, fn: (client: Client) => T): Promise<Awaited<T> | undefined> {
+    this.#pendingOps.add(pending);
+    try {
+      return await this.#executeCommand(client => {
+        pending.dispatched = true;
+        return fn(client);
+      });
+    } catch (err) {
+      // the extraction that tore this client down carried the intent to the
+      // adopting member — the op semantically succeeded there
+      if (pending.carried) return undefined;
+      throw err;
+    } finally {
+      this.#pendingOps.delete(pending);
+    }
+  }
+
+  subscribe<T extends boolean = false>(
+    channels: string | Array<string>,
+    listener: PubSubListener<T>,
+    bufferMode?: T
+  ) {
+    return this.#tracked(
+      subscribeOp(PUBSUB_TYPE.CHANNELS, channels, listener as PubSubListener<boolean>, bufferMode),
+      client => client.SUBSCRIBE(channels, listener, bufferMode)
+    );
+  }
+
+  #unsubscribe<T>(pending: PendingOp, fn: (client: Client) => Promise<T>) {
+    return this.#tracked(pending, async client => {
+      const reply = await fn(client);
+
+      if (!client.isPubSubActive) {
+        // destroy() clears #state AND the adopted #subscriptions snapshot; a
+        // bare client.destroy() would leave the snapshot behind for the next
+        // extractListeners to resurrect on another member
+        this.destroy();
+      }
+
+      return reply;
+    });
+  }
+
+  async unsubscribe<T extends boolean = false>(
+    channels?: string | Array<string>,
+    listener?: PubSubListener<boolean>,
+    bufferMode?: T
+  ) {
+    return this.#unsubscribe(
+      unsubscribeOp(PUBSUB_TYPE.CHANNELS, channels, listener, bufferMode),
+      client => client.UNSUBSCRIBE(channels, listener, bufferMode)
+    );
+  }
+
+  async pSubscribe<T extends boolean = false>(
+    patterns: string | Array<string>,
+    listener: PubSubListener<T>,
+    bufferMode?: T
+  ) {
+    return this.#tracked(
+      subscribeOp(PUBSUB_TYPE.PATTERNS, patterns, listener as PubSubListener<boolean>, bufferMode),
+      client => client.PSUBSCRIBE(patterns, listener, bufferMode)
+    );
+  }
+
+  async pUnsubscribe<T extends boolean = false>(
+    patterns?: string | Array<string>,
+    listener?: PubSubListener<T>,
+    bufferMode?: T
+  ) {
+    return this.#unsubscribe(
+      unsubscribeOp(PUBSUB_TYPE.PATTERNS, patterns, listener as PubSubListener<boolean>, bufferMode),
+      client => client.PUNSUBSCRIBE(patterns, listener, bufferMode)
+    );
+  }
+
+  sSubscribe<T extends boolean = false>(
+    channels: string | Array<string>,
+    listener: PubSubListener<T>,
+    bufferMode?: T
+  ) {
+    return this.#tracked(
+      subscribeOp(PUBSUB_TYPE.SHARDED, channels, listener as PubSubListener<boolean>, bufferMode),
+      client => client.SSUBSCRIBE(channels, listener, bufferMode)
+    );
+  }
+
+  async sUnsubscribe<T extends boolean = false>(
+    channels?: string | Array<string>,
+    listener?: PubSubListener<T>,
+    bufferMode?: T
+  ) {
+    return this.#unsubscribe(
+      unsubscribeOp(PUBSUB_TYPE.SHARDED, channels, listener as PubSubListener<boolean>, bufferMode),
+      client => client.SUNSUBSCRIBE(channels, listener, bufferMode)
+    );
+  }
+
+  destroy() {
+    this.#subscriptions = undefined;
+    if (this.#state === undefined) return;
+    
+    // `connectPromise` already handles the case of `this.#pubSubState = undefined`
+    if (!this.#state.connectPromise) {
+      this.#state.client.destroy();
+    }
+    
+    this.#state = undefined;
+  }
+}

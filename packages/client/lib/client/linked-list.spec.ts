@@ -1,0 +1,308 @@
+import {
+  SinglyLinkedList,
+  DoublyLinkedList,
+  EmptyAwareSinglyLinkedList,
+} from "./linked-list";
+import { equal, deepEqual } from "assert/strict";
+
+describe("DoublyLinkedList", () => {
+  const list = new DoublyLinkedList<number>();
+
+  it("should start empty", () => {
+    equal(list.length, 0);
+    equal(list.head, undefined);
+    equal(list.tail, undefined);
+    deepEqual(Array.from(list), []);
+  });
+
+  it("shift empty", () => {
+    equal(list.shift(), undefined);
+    equal(list.length, 0);
+    deepEqual(Array.from(list), []);
+  });
+
+  it("push 1", () => {
+    list.push(1);
+    equal(list.length, 1);
+    deepEqual(Array.from(list), [1]);
+  });
+
+  it("push 2", () => {
+    list.push(2);
+    equal(list.length, 2);
+    deepEqual(Array.from(list), [1, 2]);
+  });
+
+  it("unshift 0", () => {
+    list.unshift(0);
+    equal(list.length, 3);
+    deepEqual(Array.from(list), [0, 1, 2]);
+  });
+
+  it("remove middle node", () => {
+    list.remove(list.head!.next!);
+    equal(list.length, 2);
+    deepEqual(Array.from(list), [0, 2]);
+  });
+
+  it("remove head", () => {
+    list.remove(list.head!);
+    equal(list.length, 1);
+    deepEqual(Array.from(list), [2]);
+  });
+
+  it("remove tail", () => {
+    list.remove(list.tail!);
+    equal(list.length, 0);
+    deepEqual(Array.from(list), []);
+  });
+
+  it("unshift empty queue", () => {
+    list.unshift(0);
+    equal(list.length, 1);
+    deepEqual(Array.from(list), [0]);
+  });
+
+  it("push 1", () => {
+    list.push(1);
+    equal(list.length, 2);
+    deepEqual(Array.from(list), [0, 1]);
+  });
+
+  it("shift", () => {
+    equal(list.shift(), 0);
+    equal(list.length, 1);
+    deepEqual(Array.from(list), [1]);
+  });
+
+  it("shift last element", () => {
+    equal(list.shift(), 1);
+    equal(list.length, 0);
+    deepEqual(Array.from(list), []);
+  });
+
+  it("provide forEach for nodes", () => {
+    list.reset();
+    list.push(1);
+    list.push(2);
+    list.push(3);
+    let count = 0;
+    for(const _ of list.nodes()) {
+      count++;
+    }
+    equal(count, 3);
+    for(const _ of list.nodes()) {
+      count++;
+    }
+    equal(count, 6);
+  });
+
+  it("should handle remove on empty list", () => {
+    list.reset();
+    const node = list.push(1);
+    list.remove(node);
+    equal(list.length, 0);
+    deepEqual(Array.from(list), []);
+    list.remove(node);
+    equal(list.length, 0);
+    deepEqual(Array.from(list), []);
+  });
+
+
+  it("should safely remove nodes while iterating", () => {
+    list.reset();
+    list.push(1);
+    list.push(2);
+    list.push(3);
+    list.push(4);
+    list.push(5);
+    
+    const visited: number[] = [];
+    for (const node of list.nodes()) {
+      visited.push(node.value);
+      if (node.value % 2 === 0) {
+        list.remove(node);
+      }
+    }
+    deepEqual(visited, [1, 2, 3, 4, 5]);
+    equal(list.length, 3);
+    deepEqual(Array.from(list), [1, 3, 5]);
+  });
+
+  it("remove is idempotent — removing an already-removed node does not corrupt the list", () => {
+    list.reset();
+    const a = list.push(1);
+    const b = list.push(2);
+    const c = list.push(3);
+
+    list.remove(b); // remove the middle node
+    equal(list.length, 2);
+    deepEqual(Array.from(list), [1, 3]);
+
+    list.remove(b); // same node again — must be a no-op, not a corruption
+    equal(list.length, 2);
+    deepEqual(Array.from(list), [1, 3]);
+    equal(list.head, a);
+    equal(list.tail, c);
+  });
+
+  it("should clear the previous pointer of the new head when removing the head", () => {
+    list.reset();
+    const first = list.push(1);
+    list.push(2);
+    list.remove(first);
+    equal(list.head!.previous, undefined);
+  });
+
+  it("should stay consistent after removing the head and then the tail", () => {
+    list.reset();
+    const first = list.push(1);
+    const second = list.push(2);
+    list.remove(first);
+    list.remove(second);
+    equal(list.length, 0);
+    equal(list.head, undefined);
+    equal(list.tail, undefined);
+    list.push(3);
+    equal(list.length, 1);
+    deepEqual(Array.from(list), [3]);
+  });
+});
+
+describe("DoublyLinkedList.insertAfter", () => {
+  it("inserts in the middle", () => {
+    const list = new DoublyLinkedList<number>();
+    const first = list.push(1);
+    list.push(3);
+
+    const node = list.insertAfter(first, 2);
+
+    equal(list.length, 3);
+    deepEqual(Array.from(list), [1, 2, 3]);
+    equal(node.previous, first);
+    equal(node.next, list.tail);
+    equal(list.tail!.previous, node);
+  });
+
+  it("updates the tail when inserting after it", () => {
+    const list = new DoublyLinkedList<number>();
+    list.push(1);
+    const tail = list.push(2);
+
+    const node = list.insertAfter(tail, 3);
+
+    equal(list.tail, node);
+    equal(node.next, undefined);
+    equal(list.length, 3);
+    deepEqual(Array.from(list), [1, 2, 3]);
+  });
+
+  it("works on a single node list", () => {
+    const list = new DoublyLinkedList<number>();
+    const only = list.push(1);
+
+    const node = list.insertAfter(only, 2);
+
+    equal(list.head, only);
+    equal(list.tail, node);
+    deepEqual(Array.from(list), [1, 2]);
+  });
+});
+
+describe("SinglyLinkedList", () => {
+  const list = new SinglyLinkedList();
+
+  it("should start empty", () => {
+    equal(list.length, 0);
+    equal(list.head, undefined);
+    equal(list.tail, undefined);
+    deepEqual(Array.from(list), []);
+  });
+
+  it("shift empty", () => {
+    equal(list.shift(), undefined);
+    equal(list.length, 0);
+    deepEqual(Array.from(list), []);
+  });
+
+  it("push 1", () => {
+    list.push(1);
+    equal(list.length, 1);
+    deepEqual(Array.from(list), [1]);
+  });
+
+  it("push 2", () => {
+    list.push(2);
+    equal(list.length, 2);
+    deepEqual(Array.from(list), [1, 2]);
+  });
+
+  it("push 3", () => {
+    list.push(3);
+    equal(list.length, 3);
+    deepEqual(Array.from(list), [1, 2, 3]);
+  });
+
+  it("shift 1", () => {
+    equal(list.shift(), 1);
+    equal(list.length, 2);
+    deepEqual(Array.from(list), [2, 3]);
+  });
+
+  it("shift 2", () => {
+    equal(list.shift(), 2);
+    equal(list.length, 1);
+    deepEqual(Array.from(list), [3]);
+  });
+
+  it("shift 3", () => {
+    equal(list.shift(), 3);
+    equal(list.length, 0);
+    deepEqual(Array.from(list), []);
+  });
+
+  it("should be empty", () => {
+    equal(list.length, 0);
+    equal(list.head, undefined);
+    equal(list.tail, undefined);
+  });
+});
+
+describe("EmptyAwareSinglyLinkedList", () => {
+  it("should emit 'empty' event when reset", () => {
+    const list = new EmptyAwareSinglyLinkedList<number>();
+    let count = 0;
+    list.events.on("empty", () => count++);
+    list.push(1);
+    list.reset();
+    equal(count, 1);
+    list.reset();
+    equal(count, 1);
+  });
+
+  it("should emit 'empty' event when shift makes the list empty", () => {
+    const list = new EmptyAwareSinglyLinkedList<number>();
+    let count = 0;
+    list.events.on("empty", () => count++);
+    list.push(1);
+    list.push(2);
+    list.shift();
+    equal(count, 0);
+    list.shift();
+    equal(count, 1);
+    list.shift();
+    equal(count, 1);
+  });
+
+  it("should emit 'empty' event when remove makes the list empty", () => {
+    const list = new EmptyAwareSinglyLinkedList<number>();
+    let count = 0;
+    list.events.on("empty", () => count++);
+    const node1 = list.push(1);
+    const node2 = list.push(2);
+    list.remove(node1, undefined);
+    equal(count, 0);
+    list.remove(node2, undefined);
+    equal(count, 1);
+  });
+});

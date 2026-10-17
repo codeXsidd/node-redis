@@ -1,0 +1,10 @@
+import { Command } from '../RESP/types';
+import EVAL, { parseEvalArguments } from './EVAL';
+
+export default {
+  parseCommand(...args: Parameters<typeof parseEvalArguments>) {
+    args[0].push('EVALSHA');
+    parseEvalArguments(...args);
+  },
+  transformReply: EVAL.transformReply
+} as const satisfies Command;

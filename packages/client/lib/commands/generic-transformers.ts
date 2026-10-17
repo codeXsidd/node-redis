@@ -1,0 +1,937 @@
+import { BasicCommandParser, CommandParser } from '../client/parser';
+import { REQUEST_POLICIES_WITH_DEFAULTS, RequestPolicyWithDefaults, RESPONSE_POLICIES_WITH_DEFAULTS, ResponsePolicyWithDefaults } from '../command-metadata/policies-constants';
+import { RESP_TYPES } from '../RESP/decoder';
+import { UnwrapReply, ArrayReply, BlobStringReply, BooleanReply, CommandArguments, DoubleReply, NullReply, NumberReply, RedisArgument, ReplyUnion, TuplesReply, MapReply, TypeMapping, Command } from '../RESP/types';
+
+export function isNullReply(reply: unknown): reply is NullReply {
+  return reply === null;
+}
+
+export function isArrayReply(reply: unknown): reply is ArrayReply<unknown> {
+  return Array.isArray(reply);
+}
+
+export const transformBooleanReply = {
+  2: (reply: NumberReply<0 | 1>) => reply as unknown as UnwrapReply<typeof reply> === 1,
+  3: undefined as unknown as () => BooleanReply
+};
+
+export const transformBooleanArrayReply = {
+  2: (reply: ArrayReply<NumberReply<0 | 1>>) => {
+    return (reply as unknown as UnwrapReply<typeof reply>).map(transformBooleanReply[2]);
+  },
+  3: undefined as unknown as () => ArrayReply<BooleanReply>
+};
+
+export type BitValue = 0 | 1;
+
+export function transformDoubleArgument(num: number): string {
+  switch (num) {
+    case Infinity:
+      return '+inf';
+
+    case -Infinity:
+      return '-inf';
+
+    default:
+      return num.toString();
+  }
+}
+
+export function transformStringDoubleArgument(num: RedisArgument | number): RedisArgument {
+  if (typeof num !== 'number') return num;
+
+  return transformDoubleArgument(num);
+}
+
+export const transformDoubleReply = {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- matches TransformReply contract
+  2: (reply: BlobStringReply, preserve?: any, typeMapping?: TypeMapping): DoubleReply => {
+    const double = typeMapping ? typeMapping[RESP_TYPES.DOUBLE] : undefined;
+
+    switch (double) {
+      case String: {
+        return reply as unknown as DoubleReply;
+      }
+      default: {
+        let ret: number;
+
+        switch (reply.toString()) {
+          case 'inf':
+          case '+inf':
+            ret = Infinity;
+            break;
+
+          case '-inf':
+            ret = -Infinity;
+            break;
+
+          case 'nan':
+            ret = NaN;
+            break;
+
+          default:
+            ret = Number(reply);
+        }
+
+        return ret as unknown as DoubleReply;
+      }
+    }
+  },
+  3: undefined as unknown as () => DoubleReply
+};
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- matches TransformReply contract
+export function createTransformDoubleReplyResp2Func(preserve?: any, typeMapping?: TypeMapping) {
+  return (reply: BlobStringReply) => {
+    return transformDoubleReply[2](reply, preserve, typeMapping);
+  }
+}
+
+export const transformDoubleArrayReply = {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- matches TransformReply contract
+  2: (reply: Array<BlobStringReply>, preserve?: any, typeMapping?: TypeMapping) => {
+    return reply.map(createTransformDoubleReplyResp2Func(preserve, typeMapping));
+  },
+  3: undefined as unknown as () => ArrayReply<DoubleReply>
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- matches TransformReply contract
+export function createTransformNullableDoubleReplyResp2Func(preserve?: any, typeMapping?: TypeMapping) {
+  return (reply: BlobStringReply | NullReply) => {
+    return transformNullableDoubleReply[2](reply, preserve, typeMapping);
+  }
+}
+
+export const transformNullableDoubleReply = {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- matches TransformReply contract
+  2: (reply: BlobStringReply | NullReply, preserve?: any, typeMapping?: TypeMapping) => {
+    if (reply === null) return null;
+
+    return transformDoubleReply[2](reply as BlobStringReply, preserve, typeMapping);
+  },
+  3: undefined as unknown as () => DoubleReply | NullReply
+};
+
+export interface Stringable {
+  toString(): string;
+}
+
+export function transformTuplesToMap<T>(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- generic over arbitrary tuple element types
+  reply: UnwrapReply<ArrayReply<any>>,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- generic over arbitrary tuple element types
+  func: (elem: any) => T,
+) {
+  const message: Record<string, T> = {};
+
+  for (let i = 0; i < reply.length; i+= 2) {
+    message[reply[i].toString()] = func(reply[i + 1]);
+  }
+
+  return message;
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- matches TransformReply contract
+export function createTransformTuplesReplyFunc<T extends Stringable>(preserve?: any, typeMapping?: TypeMapping) {
+  return (reply: ArrayReply<T>) => {
+    return transformTuplesReply<T>(reply, preserve, typeMapping);
+  };
+}
+
+export function transformTuplesReply<T extends Stringable>(
+  reply: ArrayReply<T>,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- matches TransformReply contract
+  preserve?: any,
+  typeMapping?: TypeMapping
+): MapReply<T , T> {
+  const mapType = typeMapping ? typeMapping[RESP_TYPES.MAP] : undefined;
+
+  const inferred = reply as unknown as UnwrapReply<typeof reply>
+
+  switch (mapType) {
+    case Array: {
+      return reply as unknown as MapReply<T, T>;
+    }
+    case Map: {
+      const ret = new Map<string, BlobStringReply>;
+
+      for (let i = 0; i < inferred.length; i += 2) {
+        ret.set(inferred[i].toString(), inferred[i + 1] as unknown as BlobStringReply);
+      }
+
+      return ret as unknown as MapReply<T, T>;;
+    }
+    default: {
+      const ret: Record<string, BlobStringReply> = {};
+
+      for (let i = 0; i < inferred.length; i += 2) {
+        ret[inferred[i].toString()] = inferred[i + 1] as unknown as BlobStringReply;
+      }
+
+      return ret as unknown as MapReply<T, T>;;
+    }
+  }
+}
+
+export interface SortedSetMember {
+  value: RedisArgument;
+  score: number;
+}
+
+export type SortedSetSide = 'MIN' | 'MAX';
+
+export const transformSortedSetReply = {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- matches TransformReply contract
+  2: (reply: ArrayReply<BlobStringReply>, preserve?: any, typeMapping?: TypeMapping) => {
+    const inferred = reply as unknown as UnwrapReply<typeof reply>,
+      members = [];
+    for (let i = 0; i < inferred.length; i += 2) {
+      members.push({
+        value: inferred[i],
+        score: transformDoubleReply[2](inferred[i + 1], preserve, typeMapping)
+      });
+    }
+
+    return members;
+  },
+  3: (reply: ArrayReply<TuplesReply<[BlobStringReply, DoubleReply]>>) => {
+    return (reply as unknown as UnwrapReply<typeof reply>).map(member => {
+      const [value, score] = member as unknown as UnwrapReply<typeof member>;
+      return {
+        value,
+        score
+      };
+    });
+  }
+}
+
+export type ListSide = 'LEFT' | 'RIGHT';
+
+export function transformEXAT(EXAT: number | Date): string {
+  return (typeof EXAT === 'number' ? EXAT : Math.floor(EXAT.getTime() / 1000)).toString();
+}
+
+export function transformPXAT(PXAT: number | Date): string {
+  return (typeof PXAT === 'number' ? PXAT : PXAT.getTime()).toString();
+}
+
+export interface EvalOptions {
+  keys?: Array<string>;
+  arguments?: Array<string>;
+}
+
+export function evalFirstKeyIndex(options?: EvalOptions): string | undefined {
+  return options?.keys?.[0];
+}
+
+export function pushEvalArguments(args: Array<string>, options?: EvalOptions): Array<string> {
+  if (options?.keys) {
+    args.push(
+      options.keys.length.toString(),
+      ...options.keys
+    );
+  } else {
+    args.push('0');
+  }
+
+  if (options?.arguments) {
+    args.push(...options.arguments);
+  }
+
+  return args;
+}
+
+export function pushVariadicArguments(args: CommandArguments, value: RedisVariadicArgument): CommandArguments {
+  if (Array.isArray(value)) {
+    // https://github.com/redis/node-redis/pull/2160
+    args = args.concat(value);
+  } else {
+    args.push(value);
+  }
+
+  return args;
+}
+
+export function pushVariadicNumberArguments(
+  args: CommandArguments,
+  value: number | Array<number>
+): CommandArguments {
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      args.push(item.toString());
+    }
+  } else {
+    args.push(value.toString());
+  }
+
+  return args;
+}
+
+export type RedisVariadicArgument = RedisArgument | Array<RedisArgument>;
+
+export function pushVariadicArgument(
+  args: Array<RedisArgument>,
+  value: RedisVariadicArgument
+): CommandArguments {
+  if (Array.isArray(value)) {
+    args.push(value.length.toString(), ...value);
+  } else {
+    args.push('1', value);
+  }
+
+  return args;
+}
+
+export function parseOptionalVariadicArgument(
+  parser: CommandParser,
+  name: RedisArgument,
+  value?: RedisVariadicArgument
+) {
+  if (value === undefined) return;
+
+  parser.push(name);
+
+  parser.pushVariadicWithLength(value);
+}
+
+export enum CommandFlags {
+  WRITE = 'write', // command may result in modifications
+  READONLY = 'readonly', // command will never modify keys
+  DENYOOM = 'denyoom', // reject command if currently out of memory
+  ADMIN = 'admin', // server admin command
+  PUBSUB = 'pubsub', // pubsub-related command
+  NOSCRIPT = 'noscript', // deny this command from scripts
+  RANDOM = 'random', // command has random results, dangerous for scripts
+  SORT_FOR_SCRIPT = 'sort_for_script', // if called from script, sort output
+  LOADING = 'loading', // allow command while database is loading
+  STALE = 'stale', // allow command while replica has stale data
+  SKIP_MONITOR = 'skip_monitor', // do not show this command in MONITOR
+  ASKING = 'asking', // cluster related - accept even if importing
+  FAST = 'fast', // command operates in constant or log(N) time. Used for latency monitoring.
+  MOVABLEKEYS = 'movablekeys' // keys have no pre-determined position. You must discover keys yourself.
+}
+
+export enum CommandCategories {
+  KEYSPACE = '@keyspace',
+  READ = '@read',
+  WRITE = '@write',
+  SET = '@set',
+  SORTEDSET = '@sortedset',
+  LIST = '@list',
+  HASH = '@hash',
+  STRING = '@string',
+  BITMAP = '@bitmap',
+  HYPERLOGLOG = '@hyperloglog',
+  GEO = '@geo',
+  STREAM = '@stream',
+  PUBSUB = '@pubsub',
+  ADMIN = '@admin',
+  FAST = '@fast',
+  SLOW = '@slow',
+  BLOCKING = '@blocking',
+  DANGEROUS = '@dangerous',
+  CONNECTION = '@connection',
+  TRANSACTION = '@transaction',
+  SCRIPTING = '@scripting'
+}
+
+export type CommandRawReply = [
+  name: string,
+  arity: number,
+  flags: Array<CommandFlags>,
+  firstKeyIndex: number,
+  lastKeyIndex: number,
+  step: number,
+  categories: Array<CommandCategories>,
+  tips: Array<string>,
+  keySpecifications: Array<unknown>,
+  subcommands: Array<CommandRawReply>
+];
+
+export type KeySpec = {
+  beginSearch:
+    | { type: 'index'; index: number }
+    | { type: 'keyword'; keyword: string; startFrom: number }
+    | { type: 'unknown' };
+  findKeys:
+    | { type: 'range'; lastKey: number; keyStep: number; limit: number }
+    | { type: 'keynum'; keyNumIdx: number; firstKey: number; keyStep: number }
+    | { type: 'unknown' };
+};
+
+export type CommandReply = {
+  name: string,
+  arity: number,
+  flags: Set<CommandFlags>,
+  firstKeyIndex: number,
+  lastKeyIndex: number,
+  step: number,
+  categories: Set<CommandCategories>,
+  policies: { request: RequestPolicyWithDefaults | undefined, response: ResponsePolicyWithDefaults | undefined }
+  isKeyless: boolean,
+  /**
+   * True when the server tags the command with the `nondeterministic_output`
+   * tip (e.g. XPENDING). Distinct from `nondeterministic_output_order`, which
+   * is NOT captured here. Consumed to precompute `cacheable`.
+   */
+  nondeterministicOutput: boolean,
+  /**
+   * Raw command tips, minus the `request_policy:` / `response_policy:` tips
+   * (captured separately in `policies`). Carries `nondeterministic_output`,
+   * `dont_cache`, etc. — mirrored into `CommandMetadata.tips` so CSC
+   * eligibility is derived from the raw server signal.
+   */
+  tips: Array<string>,
+  keySpecs: Array<KeySpec>,
+  subcommands: Array<CommandReply>
+};
+
+/**
+ * Normalizes one map-shaped level of a key specification to the RESP3 object
+ * shape. RESP3 already delivers objects; RESP2 delivers the same data as flat
+ * `[field, value, ...]` pair arrays.
+ */
+function normalizeKeySpecMap(raw: unknown): Record<string, unknown> | undefined {
+  if (raw === null || typeof raw !== 'object') return undefined;
+
+  if (!Array.isArray(raw)) return raw as Record<string, unknown>;
+
+  if (raw.length % 2 !== 0) return undefined;
+
+  const normalized: Record<string, unknown> = {};
+  for (let i = 0; i < raw.length; i += 2) {
+    const field = raw[i];
+    if (typeof field !== 'string') return undefined;
+    normalized[field] = raw[i + 1];
+  }
+  return normalized;
+}
+
+function transformNumber(raw: unknown): number | undefined {
+  const value = Number(raw);
+  return Number.isInteger(value) ? value : undefined;
+}
+
+const UNKNOWN_KEY_SPEC_PART = { type: 'unknown' } as const;
+
+function transformBeginSearch(raw: unknown): KeySpec['beginSearch'] {
+  const beginSearch = normalizeKeySpecMap(raw);
+  const spec = normalizeKeySpecMap(beginSearch?.spec);
+  if (!beginSearch || !spec) return UNKNOWN_KEY_SPEC_PART;
+
+  switch (beginSearch.type) {
+    case 'index': {
+      const index = transformNumber(spec.index);
+      if (index !== undefined) return { type: 'index', index };
+      break;
+    }
+    case 'keyword': {
+      const startFrom = transformNumber(spec.startfrom);
+      if (typeof spec.keyword === 'string' && startFrom !== undefined) {
+        return { type: 'keyword', keyword: spec.keyword, startFrom };
+      }
+      break;
+    }
+  }
+  return UNKNOWN_KEY_SPEC_PART;
+}
+
+function transformFindKeys(raw: unknown): KeySpec['findKeys'] {
+  const findKeys = normalizeKeySpecMap(raw);
+  const spec = normalizeKeySpecMap(findKeys?.spec);
+  if (!findKeys || !spec) return UNKNOWN_KEY_SPEC_PART;
+
+  switch (findKeys.type) {
+    case 'range': {
+      const lastKey = transformNumber(spec.lastkey),
+        keyStep = transformNumber(spec.keystep),
+        limit = transformNumber(spec.limit);
+      if (lastKey !== undefined && keyStep !== undefined && limit !== undefined) {
+        return { type: 'range', lastKey, keyStep, limit };
+      }
+      break;
+    }
+    case 'keynum': {
+      const keyNumIdx = transformNumber(spec.keynumidx),
+        firstKey = transformNumber(spec.firstkey),
+        keyStep = transformNumber(spec.keystep);
+      if (keyNumIdx !== undefined && firstKey !== undefined && keyStep !== undefined) {
+        return { type: 'keynum', keyNumIdx, firstKey, keyStep };
+      }
+      break;
+    }
+  }
+  return UNKNOWN_KEY_SPEC_PART;
+}
+
+/**
+ * Parses one COMMAND key-specification entry. Unrecognized or malformed
+ * shapes parse to `{ type: 'unknown' }` parts instead of throwing — consumers
+ * (e.g. the multi_shard splitter) decide whether unknown is acceptable.
+ */
+export function transformKeySpec(raw: unknown): KeySpec {
+  const entry = normalizeKeySpecMap(raw);
+  return {
+    beginSearch: transformBeginSearch(entry?.begin_search),
+    findKeys: transformFindKeys(entry?.find_keys)
+  };
+}
+
+export function transformCommandReply(
+  this: void,
+  // Fields 8-10 (tips, key specifications, subcommands) exist since Redis 7.0;
+  // default them so a shorter reply (older server, truncating proxy) parses
+  // instead of throwing "tips is not iterable".
+  [name, arity, flags, firstKeyIndex, lastKeyIndex, step, categories, tips = [], keySpecifications = [], subcommandsReply = []]: CommandRawReply
+): CommandReply {
+
+
+  // Tips are free-form hints with no ordering guarantee — commands like INFO
+  // declare 'nondeterministic_output' before their policy tips, so scan the
+  // whole array instead of relying on positions.
+  let requestPolicy: RequestPolicyWithDefaults | undefined;
+  let responsePolicy: ResponsePolicyWithDefaults | undefined;
+  // Exact match — must NOT catch 'nondeterministic_output_order', which does
+  // not disqualify caching (HGETALL/SMEMBERS keep unordered but cacheable).
+  let nondeterministicOutput = false;
+  // Non-policy tips, mirrored verbatim into CommandMetadata.tips (dont_cache,
+  // nondeterministic_output, ...). The policy tips are captured separately.
+  const otherTips: Array<string> = [];
+
+  for (const tip of tips) {
+    if (tip.startsWith('request_policy:')) {
+      const raw = tip.slice('request_policy:'.length);
+      if ((Object.values(REQUEST_POLICIES_WITH_DEFAULTS) as string[]).includes(raw)) {
+        requestPolicy = raw as RequestPolicyWithDefaults;
+      }
+    } else if (tip.startsWith('response_policy:')) {
+      const raw = tip.slice('response_policy:'.length);
+      if ((Object.values(RESPONSE_POLICIES_WITH_DEFAULTS) as string[]).includes(raw)) {
+        responsePolicy = raw as ResponsePolicyWithDefaults;
+      }
+    } else {
+      otherTips.push(tip);
+      if (tip === 'nondeterministic_output') {
+        nondeterministicOutput = true;
+      }
+    }
+  }
+
+  const subcommands = subcommandsReply.map(transformCommandReply);
+
+  return {
+    name,
+    arity,
+    flags: new Set(flags),
+    firstKeyIndex,
+    lastKeyIndex,
+    step,
+    categories: new Set(categories),
+    policies: {
+      request: requestPolicy,
+      response: responsePolicy
+    },
+    isKeyless: keySpecifications.length === 0,
+    nondeterministicOutput,
+    tips: otherTips,
+    keySpecs: keySpecifications.map(transformKeySpec),
+    subcommands
+  };
+}
+
+export enum RedisFunctionFlags {
+  NO_WRITES = 'no-writes',
+  ALLOW_OOM = 'allow-oom',
+  ALLOW_STALE = 'allow-stale',
+  NO_CLUSTER = 'no-cluster'
+}
+
+export type FunctionListRawItemReply = [
+  'library_name',
+  string,
+  'engine',
+  string,
+  'functions',
+  Array<[
+    'name',
+    string,
+    'description',
+    string | null,
+    'flags',
+    Array<RedisFunctionFlags>
+  ]>
+];
+
+export interface FunctionListItemReply {
+  libraryName: string;
+  engine: string;
+  functions: Array<{
+    name: string;
+    description: string | null;
+    flags: Array<RedisFunctionFlags>;
+  }>;
+}
+
+export function transformFunctionListItemReply(reply: FunctionListRawItemReply): FunctionListItemReply {
+  return {
+    libraryName: reply[1],
+    engine: reply[3],
+    functions: reply[5].map(fn => ({
+      name: fn[1],
+      description: fn[3],
+      flags: fn[5]
+    }))
+  };
+}
+
+export interface SlotRange {
+  start: number;
+  end: number;
+}
+
+function parseSlotRangeArguments(
+  parser: CommandParser,
+  range: SlotRange
+): void {
+  parser.push(
+    range.start.toString(),
+    range.end.toString()
+  );
+}
+
+export function parseSlotRangesArguments(
+  parser: CommandParser,
+  ranges: SlotRange | Array<SlotRange>
+) {
+  if (Array.isArray(ranges)) {
+    for (const range of ranges) {
+      parseSlotRangeArguments(parser, range);
+    }
+  } else {
+    parseSlotRangeArguments(parser, ranges);
+  }
+}
+
+export type RawRangeReply = [
+  start: number,
+  end: number
+];
+
+export interface RangeReply {
+  start: number;
+  end: number;
+}
+
+export function transformRangeReply([start, end]: RawRangeReply): RangeReply {
+  return {
+    start,
+    end
+  };
+}
+
+export type ZKeyAndWeight = {
+  key: RedisArgument;
+  weight: number;
+};
+
+export type ZVariadicKeys<T> = T | [T, ...Array<T>];
+
+export type ZKeys = ZVariadicKeys<RedisArgument> | ZVariadicKeys<ZKeyAndWeight>;
+
+export function parseZKeysArguments(
+  parser: CommandParser,
+  keys: ZKeys
+) {
+  if (Array.isArray(keys)) {
+    parser.push(keys.length.toString());
+
+    if (keys.length) {
+      if (isPlainKeys(keys)) {
+        parser.pushKeys(keys);
+      } else {
+        for (let i = 0; i < keys.length; i++) {
+          parser.pushKey(keys[i].key)
+        }
+        parser.push('WEIGHTS');
+        for (let i = 0; i < keys.length; i++) {
+          parser.push(transformDoubleArgument(keys[i].weight));
+        }
+      }
+    }
+  } else {
+    parser.push('1');
+
+    if (isPlainKey(keys)) {
+      parser.pushKey(keys);
+    } else {
+      parser.pushKey(keys.key);
+      parser.push('WEIGHTS', transformDoubleArgument(keys.weight));
+    }
+  }
+}
+
+function isPlainKey(key: RedisArgument | ZKeyAndWeight): key is RedisArgument {
+  return typeof key === 'string' || key instanceof Buffer;
+}
+
+function isPlainKeys(keys: Array<RedisArgument> | Array<ZKeyAndWeight>): keys is Array<RedisArgument> {
+  return isPlainKey(keys[0]);
+}
+
+export type Tail<T extends unknown[]> = T extends [unknown, ...infer Tail] ? Tail : never;
+
+/**
+ * @deprecated
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- variadic command args of mixed types
+export function parseArgs(command: Command, ...args: Array<any>): CommandArguments {
+  const parser = new BasicCommandParser();
+  command.parseCommand!(parser, ...args);
+
+  const redisArgs: CommandArguments = parser.redisArgs;
+  if (parser.preserve) {
+    redisArgs.preserve = parser.preserve;
+  }
+  return redisArgs;
+}
+
+export type StreamMessageRawReply = TuplesReply<[
+  id: BlobStringReply,
+  message: ArrayReply<BlobStringReply>,
+  millisElapsedFromDelivery?: NumberReply,
+  deliveriesCounter?: NumberReply
+]>;
+
+export type StreamMessageReply = {
+  id: BlobStringReply,
+  message: MapReply<BlobStringReply | string, BlobStringReply>,
+  millisElapsedFromDelivery?: NumberReply
+  deliveriesCounter?: NumberReply
+};
+
+export function transformStreamMessageReply(typeMapping: TypeMapping | undefined, reply: StreamMessageRawReply): StreamMessageReply {
+  const [ id, message, millisElapsedFromDelivery, deliveriesCounter ] = reply as unknown as UnwrapReply<typeof reply>;
+  return {
+    id: id,
+    message: message === null ?
+      null as unknown as StreamMessageReply['message'] :
+      transformTuplesReply(message, undefined, typeMapping),
+    ...(millisElapsedFromDelivery !== undefined ? { millisElapsedFromDelivery } : {}),
+    ...(deliveriesCounter !== undefined ? { deliveriesCounter } : {})
+  };
+}
+
+export function transformStreamMessageNullReply(typeMapping: TypeMapping | undefined, reply: StreamMessageRawReply | NullReply) {
+  return isNullReply(reply) ? reply : transformStreamMessageReply(typeMapping, reply);
+}
+
+export type StreamMessagesReply = Array<StreamMessageReply>;
+
+export type StreamsMessagesReply = Array<{
+  name: BlobStringReply | string;
+  messages: StreamMessagesReply;
+}> | null;
+
+export function transformStreamMessagesReply(
+  r: ArrayReply<StreamMessageRawReply>,
+  typeMapping?: TypeMapping
+): StreamMessagesReply {
+  const reply = r as unknown as UnwrapReply<typeof r>;
+
+  return reply.map(transformStreamMessageReply.bind(undefined, typeMapping));
+}
+
+type StreamMessagesRawReply = TuplesReply<[name: BlobStringReply, messages: ArrayReply<StreamMessageRawReply>]>;
+export type StreamsMessagesRawReply2 = ArrayReply<StreamMessagesRawReply>;
+
+export function transformStreamsMessagesReplyResp2(
+  reply: UnwrapReply<StreamsMessagesRawReply2 | NullReply>,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- matches TransformReply contract
+  preserve?: any,
+  typeMapping?: TypeMapping
+): StreamsMessagesReply | NullReply {
+  // FUTURE: resposne type if resp3 was working, reverting to old v4 for now
+  //: MapReply<BlobStringReply | string, StreamMessagesReply> | NullReply {
+  if (reply === null) return null as unknown as NullReply;
+
+  switch (typeMapping? typeMapping[RESP_TYPES.MAP] : undefined) {
+/* FUTURE: a response type for when resp3 is working properly
+    case Map: {
+      const ret = new Map<string, StreamMessagesReply>();
+
+      for (let i=0; i < reply.length; i++) {
+        const stream = reply[i] as unknown as UnwrapReply<StreamMessagesRawReply>;
+
+        const name = stream[0];
+        const rawMessages = stream[1];
+
+        ret.set(name.toString(), transformStreamMessagesReply(rawMessages, typeMapping));
+      }
+
+      return ret as unknown as MapReply<string, StreamMessagesReply>;
+    }
+    case Array: {
+      const ret: Array<BlobStringReply | StreamMessagesReply> = [];
+
+      for (let i=0; i < reply.length; i++) {
+        const stream = reply[i] as unknown as UnwrapReply<StreamMessagesRawReply>;
+
+        const name = stream[0];
+        const rawMessages = stream[1];
+
+        ret.push(name);
+        ret.push(transformStreamMessagesReply(rawMessages, typeMapping));
+      }
+
+      return ret as unknown as MapReply<string, StreamMessagesReply>;
+    }
+    default: {
+      const ret: Record<string, StreamMessagesReply> = {};
+
+      for (let i=0; i < reply.length; i++) {
+        const stream = reply[i] as unknown as UnwrapReply<StreamMessagesRawReply>;
+
+        const name = stream[0] as unknown as UnwrapReply<BlobStringReply>;
+        const rawMessages = stream[1];
+
+        ret[name.toString()] = transformStreamMessagesReply(rawMessages);
+      }
+
+      return ret as unknown as MapReply<string, StreamMessagesReply>;
+    }
+*/
+    // V4 compatible response type
+    default: {
+      const ret: StreamsMessagesReply = [];
+
+      for (let i=0; i < reply.length; i++) {
+        const stream = reply[i] as unknown as UnwrapReply<StreamMessagesRawReply>;
+
+        ret.push({
+          name: stream[0],
+          messages: transformStreamMessagesReply(stream[1], typeMapping)
+        });
+      }
+
+      return ret;
+    }
+  }
+}
+
+type StreamsMessagesRawReply3 = MapReply<BlobStringReply, ArrayReply<StreamMessageRawReply>>;
+
+export function transformStreamsMessagesReplyResp3(
+  reply: UnwrapReply<StreamsMessagesRawReply3 | NullReply>,
+  typeMapping?: TypeMapping
+): MapReply<BlobStringReply, StreamMessagesReply> | NullReply {
+  if (reply === null) return null as unknown as NullReply;
+
+  if (reply instanceof Map) {
+    const ret = new Map<string, StreamMessagesReply>();
+
+    for (const [n, rawMessages] of reply) {
+      const name = n as unknown as UnwrapReply<BlobStringReply>;
+
+      ret.set(name.toString(), transformStreamMessagesReply(rawMessages, typeMapping));
+    }
+
+    return ret as unknown as MapReply<BlobStringReply, StreamMessagesReply>
+  } else if (reply instanceof Array) {
+    const ret = [];
+
+    for (let i=0; i < reply.length; i += 2) {
+      const name = reply[i] as BlobStringReply;
+      const rawMessages = reply[i+1] as ArrayReply<StreamMessageRawReply>;
+
+      ret.push(name);
+      ret.push(transformStreamMessagesReply(rawMessages, typeMapping));
+    }
+
+    return ret as unknown as MapReply<BlobStringReply, StreamMessagesReply>
+  } else {
+    const ret: Record<string, StreamMessagesReply> = {};
+    for (const [name, rawMessages] of Object.entries(reply)) {
+      ret[name] = transformStreamMessagesReply(rawMessages, typeMapping);
+    }
+
+    return ret as unknown as MapReply<BlobStringReply, StreamMessagesReply>
+  }
+}
+
+/**
+ * v4/v5-compatible XREAD/XREADGROUP shape: a flat
+ * `Array<{ name, messages }>` regardless of `typeMapping[RESP_TYPES.MAP]`.
+ *
+ * The outer container is intentionally normalized; `typeMapping` is still
+ * forwarded to the inner message-body transform so individual stream messages
+ * honor `RESP_TYPES.MAP` (e.g. `XRANGE`-style body shape). If you want the
+ * outer container itself as a `Map`/`Array`/`Object`, use the non-compat
+ * `transformStreamsMessagesReplyResp3` directly.
+ */
+export function transformStreamsMessagesReplyResp3Compat(
+  reply: ReplyUnion,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- matches TransformReply contract
+  preserve?: any,
+  typeMapping?: TypeMapping
+) {
+  const transformed = transformStreamsMessagesReplyResp3(
+    reply as unknown as Parameters<typeof transformStreamsMessagesReplyResp3>[0],
+    typeMapping
+  );
+  if (transformed === null) return null;
+
+  const compat = [];
+
+  if (transformed instanceof Map) {
+    for (const [name, messages] of transformed.entries()) {
+      compat.push({
+        name,
+        messages
+      });
+    }
+
+    return compat;
+  }
+
+  if (Array.isArray(transformed)) {
+    for (let i = 0; i < transformed.length; i += 2) {
+      const rawName = transformed[i] as unknown as UnwrapReply<BlobStringReply>;
+      compat.push({
+        name: rawName?.toString?.() ?? rawName,
+        messages: transformed[i + 1]
+      });
+    }
+
+    return compat;
+  }
+
+  for (const [name, messages] of Object.entries(transformed)) {
+    compat.push({
+      name,
+      messages
+    });
+  }
+
+  return compat;
+}
+
+export type RedisJSON = null | boolean | number | string | Date | Array<RedisJSON> | {
+  [key: string]: RedisJSON;
+  [key: number]: RedisJSON;
+};
+
+export function transformRedisJsonArgument(json: RedisJSON): string {
+  return JSON.stringify(json);
+}
+
+export type JsonReviver = Parameters<typeof JSON.parse>[1];
+
+export function transformRedisJsonReply(json: BlobStringReply, reviver?: JsonReviver): RedisJSON {
+  const res = JSON.parse((json as unknown as UnwrapReply<typeof json>).toString(), reviver);
+  return res;
+}
+
+export function transformRedisJsonNullReply(json: NullReply | BlobStringReply, reviver?: JsonReviver ): NullReply | RedisJSON {
+  return isNullReply(json) ? json : transformRedisJsonReply(json, reviver);
+}
